@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v7 - Build and Test QuickSafe
-run-name: QuickSafe v7 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v8 - Build and Test QuickSafe
+run-name: QuickSafe v8 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v7.yml'
+      - '.github/workflows/QuickSafe-oracle-v8.yml'
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   quicksafe:
     name: Build QuickSafe and run LibCalls on Oracle
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, quicksafe]
     timeout-minutes: 720
     defaults:
       run:
@@ -33,7 +33,7 @@ jobs:
       - name: 01 - Verify Oracle runner and prepare diagnostics
         run: |
           set -Eeuo pipefail
-          [[ "$RUNNER_NAME" == hobbit ]] || { echo "::error::Expected Oracle runner hobbit; got $RUNNER_NAME"; exit 1; }
+          [[ "$RUNNER_NAME" == quicksafe ]] || { echo "::error::Expected QuickSafe runner quicksafe; got $RUNNER_NAME"; exit 1; }
           [[ "$(uname -m)" == x86_64 ]] || exit 1
           sudo -n true || { echo '::error::Passwordless sudo required'; exit 1; }
           mkdir -p "$QS_ROOT" "$QS_ROOT/ci-logs"
@@ -142,7 +142,7 @@ jobs:
           df -h "$QS_ROOT"
           echo '====================================================='
           {
-            echo '# QuickSafe Oracle v7'
+            echo '# QuickSafe Oracle v8'
             echo "**Build:** ${{ steps.build.outcome }}"
             echo "**LibCalls test:** ${{ steps.test.outcome }}"
             echo 'This workflow builds the QuickSafe project, not HOBBIT.'
@@ -152,7 +152,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v7-${{ github.run_id }}
+          name: QuickSafe-oracle-v8-${{ github.run_id }}
           path: /home/ubuntu/quicksafe-work/ci-logs/
           if-no-files-found: warn
           retention-days: 30
