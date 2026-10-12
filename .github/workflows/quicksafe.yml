@@ -1,0 +1,168 @@
+name: QuickSafe-oracle v7 - Build and Test QuickSafe
+run-name: QuickSafe v7 | ${{ github.event_name }} | ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/QuickSafe-oracle-v7.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quicksafe-oracle-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  quicksafe:
+    name: Build QuickSafe and run LibCalls on Oracle
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 720
+    defaults:
+      run:
+        shell: bash
+    env:
+      QS_ROOT: /home/ubuntu/quicksafe-work
+      QS_REPO: https://github.com/vusec/QuickSafe.git
+      QS_REF: 515453512fc5e9991d5d9f71691a4fecd59f8f4f
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: 01 - Verify Oracle runner and prepare diagnostics
+        run: |
+          set -Eeuo pipefail
+          [[ "$RUNNER_NAME" == hobbit ]] || { echo "::error::Expected Oracle runner hobbit; got $RUNNER_NAME"; exit 1; }
+          [[ "$(uname -m)" == x86_64 ]] || exit 1
+          sudo -n true || { echo '::error::Passwordless sudo required'; exit 1; }
+          mkdir -p "$QS_ROOT" "$QS_ROOT/ci-logs"
+          echo "QS_LOGS=$QS_ROOT/ci-logs" >> "$GITHUB_ENV"
+          echo "Runner: $RUNNER_NAME | Host: $(hostname) | User: $(id -un)"
+          uname -a
+          cat /etc/os-release
+          free -h
+          df -h
+          swapon --show || true
+
+      - name: 02 - Install QuickSafe build dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git curl ca-certificates python3 python3-venv \
+            python3-dev pkg-config clang lld llvm llvm-dev libelf-dev libzstd-dev \
+            libz-dev zlib1g-dev libtinfo-dev libxml2-dev libedit-dev \
+            libncurses-dev libunwind-dev libssl-dev ccache autoconf automake libtool \
+            bison flex make patch xz-utils wget time
+          cmake --version
+          clang --version
+          llvm-config --version || true
+          python3 --version
+
+      - name: 03 - Download actual QuickSafe source and submodules
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -d "$QS_ROOT/source/.git" ]]; then
+            git clone "$QS_REPO" "$QS_ROOT/source"
+          fi
+          cd "$QS_ROOT/source"
+          git fetch origin "$QS_REF" || git fetch origin
+          git checkout --detach "$QS_REF"
+          # Original .gitmodules uses SSH; HTTPS is usable by noninteractive CI.
+          git -c url.https://github.com/.insteadOf=git@github.com: \
+              submodule update --init --recursive
+          test -f quicksafe/setup.py
+          test -f quicksafe/instances/QuickSafe.py
+          test -f quicksafe/targets/LibCalls.py
+          test -f quicksafe/infra/infra/__init__.py
+          git rev-parse HEAD | tee "$QS_LOGS/source-commit.txt"
+          git submodule status --recursive | tee "$QS_LOGS/submodules.txt"
+
+      - name: 04 - Prepare Python environment and inspect QuickSafe interface
+        run: |
+          set -Eeuo pipefail
+          python3 -m venv "$QS_ROOT/venv"
+          "$QS_ROOT/venv/bin/python" -m pip install --upgrade pip setuptools wheel
+          # Infrastructure Python dependencies may vary with its pinned revision.
+          if [[ -f "$QS_ROOT/source/quicksafe/infra/pyproject.toml" ]]; then
+            "$QS_ROOT/venv/bin/pip" install -e "$QS_ROOT/source/quicksafe/infra"
+          elif [[ -f "$QS_ROOT/source/quicksafe/infra/setup.py" ]]; then
+            "$QS_ROOT/venv/bin/pip" install -e "$QS_ROOT/source/quicksafe/infra"
+          fi
+          cd "$QS_ROOT/source/quicksafe"
+          "$QS_ROOT/venv/bin/python" setup.py --help 2>&1 | tee "$QS_LOGS/setup-help.log"
+
+      - name: 05 - Build actual QuickSafe instrumentation and LibCalls target
+        id: build
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "$QS_ROOT/source/quicksafe"
+          export PATH="$QS_ROOT/venv/bin:$PATH"
+          export CMAKE_BUILD_PARALLEL_LEVEL=1
+          export MAKEFLAGS=-j1
+          echo 'Building QuickSafe instrumentation, runtime, and LibCalls target.'
+          echo 'QuickSafe may build LLVM 16.0.6 if a compatible LLVM is not installed.'
+          python3 -u setup.py build LibCalls QuickSafe -j 1 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$QS_LOGS/build.exit"
+          exit "$rc"
+
+      - name: 06 - Run actual QuickSafe-instrumented LibCalls test
+        id: test
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "$QS_ROOT/source/quicksafe"
+          export PATH="$QS_ROOT/venv/bin:$PATH"
+          python3 -u setup.py run LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-libcalls-test.log"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$QS_LOGS/test.exit"
+          exit "$rc"
+
+      - name: 07 - Print build and test evidence
+        if: always()
+        run: |
+          set +e
+          echo '================ QUICKSAFE v7 REPORT ================'
+          echo "Runner: $RUNNER_NAME"
+          echo "Build step: ${{ steps.build.outcome }}"
+          echo "Test step: ${{ steps.test.outcome }}"
+          echo 'Source revision:'
+          cat "$QS_LOGS/source-commit.txt" 2>/dev/null || true
+          echo 'QuickSafe build log tail:'
+          tail -100 "$QS_LOGS/quicksafe-build.log" 2>/dev/null || true
+          echo 'QuickSafe test log tail:'
+          tail -120 "$QS_LOGS/quicksafe-libcalls-test.log" 2>/dev/null || true
+          echo 'Memory:'
+          free -h
+          echo 'Disk:'
+          df -h "$QS_ROOT"
+          echo '====================================================='
+          {
+            echo '# QuickSafe Oracle v7'
+            echo "**Build:** ${{ steps.build.outcome }}"
+            echo "**LibCalls test:** ${{ steps.test.outcome }}"
+            echo 'This workflow builds the QuickSafe project, not HOBBIT.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 08 - Upload QuickSafe build and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickSafe-oracle-v7-${{ github.run_id }}
+          path: /home/ubuntu/quicksafe-work/ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 09 - Enforce genuine build and test success
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          test -f "$QS_LOGS/build.exit" || { echo '::error::QuickSafe build never completed'; exit 1; }
+          [[ "$(cat "$QS_LOGS/build.exit")" == 0 ]] || { echo '::error::QuickSafe build failed'; exit 1; }
+          test -f "$QS_LOGS/test.exit" || { echo '::error::QuickSafe test never completed'; exit 1; }
+          [[ "$(cat "$QS_LOGS/test.exit")" == 0 ]] || { echo '::error::QuickSafe test failed'; exit 1; }
+          echo 'PASS: QuickSafe build and instrumented LibCalls run succeeded.'
