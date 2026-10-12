@@ -1,13 +1,12 @@
-
-name: QuickSafe-oracle v11 - Build and Test QuickSafe
-run-name: QuickSafe v11 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v13 - Build and Test QuickSafe
+run-name: QuickSafe v13 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v11.yml'
+      - '.github/workflows/QuickSafe-oracle-v13.yml'
 
 permissions:
   contents: read
@@ -21,386 +20,176 @@ jobs:
     name: Build QuickSafe and run LibCalls on Oracle
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 720
-
     defaults:
       run:
         shell: bash
-
     env:
       QS_ROOT: /home/ubuntu/quicksafe-work
       QS_REPO: https://github.com/vusec/QuickSafe.git
       QS_REF: 515453512fc5e9991d5d9f71691a4fecd59f8f4f
-      QS_LOGS: /home/ubuntu/quicksafe-work/ci-logs
+      QS_LOGS: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}
+      QS_VENV: /home/ubuntu/quicksafe-work/venvs/${{ github.run_id }}-${{ github.run_attempt }}
       PYTHONPATH: /home/ubuntu/quicksafe-work/source/quicksafe/infra
       PYTHONUNBUFFERED: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
     steps:
-      - name: 01 - Verify QuickSafe runner and prepare diagnostics
+      - name: 01 - Verify runner and initialize isolated diagnostics
         run: |
           set -Eeuo pipefail
-
-          echo "=========================================="
-          echo "QUICKSAFE ORACLE v11"
-          echo "=========================================="
-
-          echo "Runner: $RUNNER_NAME"
-          echo "Host: $(hostname)"
-          echo "User: $(id -un)"
-          echo "Repository: $GITHUB_REPOSITORY"
-
-          if [[ "$RUNNER_NAME" != "quicksafe" ]]; then
-            echo "::error::Expected runner quicksafe, got $RUNNER_NAME"
-            exit 1
-          fi
-
-          if [[ "$(uname -m)" != "x86_64" ]]; then
-            echo "::error::Requires x86_64"
-            exit 1
-          fi
-
-          if ! sudo -n true; then
-            echo "::error::Passwordless sudo required"
-            exit 1
-          fi
-
-          mkdir -p "$QS_ROOT" "$QS_LOGS"
-
-          # Prevent previous runs from supplying false success results.
-          rm -f \
-            "$QS_LOGS/build.exit" \
-            "$QS_LOGS/test.exit" \
-            "$QS_LOGS/build-duration.txt" \
-            "$QS_LOGS/test-duration.txt" \
-            "$QS_LOGS/quicksafe-build.log" \
-            "$QS_LOGS/quicksafe-libcalls-test.log"
-
-          echo "=== OPERATING SYSTEM ==="
-          cat /etc/os-release
-
-          echo "=== KERNEL ==="
-          uname -a
-
-          echo "=== MEMORY ==="
-          free -h
-
-          echo "=== SWAP ==="
+          [[ "$RUNNER_NAME" == quicksafe ]] || { echo "::error::Expected runner quicksafe; got $RUNNER_NAME"; exit 1; }
+          [[ "$(uname -m)" == x86_64 ]] || { echo '::error::x86_64 required'; exit 1; }
+          sudo -n true || { echo '::error::Passwordless sudo required'; exit 1; }
+          mkdir -p "$QS_ROOT" "$QS_LOGS" "$(dirname "$QS_VENV")"
+          echo "Runner: $RUNNER_NAME | Host: $(hostname) | User: $(id -un)"
+          echo "Run ID: $GITHUB_RUN_ID | Attempt: $GITHUB_RUN_ATTEMPT"
+          uname -a | tee "$QS_LOGS/uname.txt"
+          cat /etc/os-release | tee "$QS_LOGS/os-release.txt"
+          free -h | tee "$QS_LOGS/memory-before.txt"
+          df -h | tee "$QS_LOGS/disk-before.txt"
           swapon --show || true
 
-          echo "=== DISK ==="
-          df -h
-
-          echo "=== CPU ==="
-          nproc
-          lscpu || true
-
-      - name: 02 - Install QuickSafe build dependencies
+      - name: 02 - Install native build dependencies
         run: |
           set -Eeuo pipefail
-
           sudo apt-get update
-
-          sudo DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y --no-install-recommends \
-              build-essential \
-              cmake \
-              ninja-build \
-              git \
-              curl \
-              ca-certificates \
-              python3 \
-              python3-venv \
-              python3-dev \
-              python3-pip \
-              pkg-config \
-              clang \
-              lld \
-              llvm \
-              llvm-dev \
-              libelf-dev \
-              libzstd-dev \
-              zlib1g-dev \
-              libtinfo-dev \
-              libxml2-dev \
-              libedit-dev \
-              libncurses-dev \
-              libunwind-dev \
-              libssl-dev \
-              ccache \
-              autoconf \
-              automake \
-              libtool \
-              bison \
-              flex \
-              make \
-              patch \
-              xz-utils \
-              wget \
-              time
-
-          echo "=== TOOL VERSIONS ==="
-          cmake --version
-          ninja --version
-          clang --version
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git curl ca-certificates python3 python3-venv \
+            python3-dev python3-pip pkg-config clang lld llvm llvm-dev libelf-dev \
+            libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev libedit-dev libncurses-dev \
+            libunwind-dev libssl-dev ccache autoconf automake libtool bison flex \
+            make patch xz-utils wget time
+          { cmake --version; clang --version; python3 --version; } | tee "$QS_LOGS/tool-versions.txt"
           llvm-config --version || true
-          python3 --version
-          gcc --version | head -1
 
-      - name: 03 - Download QuickSafe source and submodules
+      - name: 03 - Checkout pinned QuickSafe source and submodules
         run: |
           set -Eeuo pipefail
-
           if [[ ! -d "$QS_ROOT/source/.git" ]]; then
             git clone "$QS_REPO" "$QS_ROOT/source"
           fi
-
           cd "$QS_ROOT/source"
-
           git fetch origin "$QS_REF" || git fetch origin
           git checkout --detach "$QS_REF"
-
-          git \
-            -c url.https://github.com/.insteadOf=git@github.com: \
+          [[ "$(git rev-parse HEAD)" == "$QS_REF" ]] || { echo '::error::Wrong source revision'; exit 1; }
+          git -c url.https://github.com/.insteadOf=git@github.com: \
             submodule update --init --recursive
-
-          echo "=== VERIFY QUICKSAFE FILES ==="
-
           test -f quicksafe/setup.py
           test -f quicksafe/instances/QuickSafe.py
           test -f quicksafe/targets/LibCalls.py
           test -f quicksafe/infra/infra/__init__.py
-
-          echo "=== SOURCE COMMIT ==="
           git rev-parse HEAD | tee "$QS_LOGS/source-commit.txt"
+          git submodule status --recursive | tee "$QS_LOGS/submodules.txt"
+          find quicksafe/infra -maxdepth 3 \( -name 'requirements*.txt' -o -name 'pyproject.toml' -o -name 'setup.py' \) \
+            -print | tee "$QS_LOGS/infra-dependency-files.txt"
 
-          echo "=== SUBMODULES ==="
-          git submodule status --recursive \
-            | tee "$QS_LOGS/submodules.txt"
-
-      - name: 04 - Prepare Python and verify QuickSafe infrastructure
+      - name: 04 - Create fresh Python environment and verify imports
+        id: python_setup
         run: |
           set -Eeuo pipefail
-
-          echo "=========================================="
-          echo "QUICKSAFE PYTHON DEPENDENCY SETUP"
-          echo "=========================================="
-
-          python3 -m venv "$QS_ROOT/venv"
-
-          PYTHON="$QS_ROOT/venv/bin/python"
+          # Per-run virtualenv prevents prior runs from masking missing dependencies.
+          python3 -m venv "$QS_VENV"
+          PYTHON="$QS_VENV/bin/python"
           INFRA="$QS_ROOT/source/quicksafe/infra"
-
-          "$PYTHON" -m pip install \
-            --upgrade pip setuptools wheel
-
-          # Fix missing Python dependency from v9.
-          "$PYTHON" -m pip install \
-            requests \
-            packaging
-
-          # Install infrastructure's declared dependencies if available.
+          "$PYTHON" -m pip install --upgrade pip setuptools wheel
+          # Confirmed missing in earlier CI traces; packaging used by tooling.
+          "$PYTHON" -m pip install requests sympy packaging
           if [[ -f "$INFRA/pyproject.toml" || -f "$INFRA/setup.py" ]]; then
             "$PYTHON" -m pip install -e "$INFRA"
           fi
-
-          # Ensure Python finds quicksafe/infra/infra rather than
-          # treating quicksafe/infra as an empty namespace package.
-          export PYTHONPATH="$INFRA${PYTHONPATH:+:$PYTHONPATH}"
-
-          echo "=== VERIFY REQUESTS ==="
-          "$PYTHON" -c \
-            "import requests; print('requests:', requests.__version__)"
-
-          echo "=== VERIFY INFRA PACKAGE LOCATION ==="
-          "$PYTHON" -c \
-            "import infra; print('infra loaded from:', infra.__file__)"
-
-          echo "=== VERIFY QUICKSAFE SETUP ==="
-          "$PYTHON" -c \
-            "from infra import Setup; print('QuickSafe Setup: PASS')"
-
-          echo "=== INSTALLED PYTHON PACKAGES ==="
-          "$PYTHON" -m pip list \
-            | tee "$QS_LOGS/python-packages.log"
-
+          if [[ -f "$INFRA/requirements.txt" ]]; then
+            "$PYTHON" -m pip install -r "$INFRA/requirements.txt"
+          fi
+          "$PYTHON" -m pip check | tee "$QS_LOGS/pip-check.log"
+          "$PYTHON" -m pip freeze | tee "$QS_LOGS/python-freeze.txt"
           cd "$QS_ROOT/source/quicksafe"
-
-          echo "=== QUICKSAFE SETUP HELP ==="
-          "$PYTHON" setup.py --help \
-            2>&1 | tee "$QS_LOGS/setup-help.log"
-
-          echo "PYTHON ENVIRONMENT: PASS"
+          "$PYTHON" - <<'PY' 2>&1 | tee "$QS_LOGS/import-preflight.log"
+          import sys
+          import requests
+          import sympy
+          import infra
+          from infra import Setup
+          print('Python:', sys.version)
+          print('requests:', requests.__version__)
+          print('sympy:', sympy.__version__)
+          print('infra:', infra.__file__)
+          print('Setup:', Setup)
+          print('QuickSafe Python imports: PASS')
+          PY
+          "$PYTHON" setup.py --help 2>&1 | tee "$QS_LOGS/setup-help.log"
 
       - name: 05 - Build QuickSafe instrumentation and LibCalls
         id: build
+        if: steps.python_setup.outcome == 'success'
         continue-on-error: true
         run: |
           set -uo pipefail
-
           cd "$QS_ROOT/source/quicksafe"
-
-          export PATH="$QS_ROOT/venv/bin:$PATH"
+          export PATH="$QS_VENV/bin:$PATH"
           export CMAKE_BUILD_PARALLEL_LEVEL=1
           export MAKEFLAGS=-j1
-
-          echo "=========================================="
-          echo "BUILDING QUICKSAFE"
-          echo "=========================================="
-
-          echo "Source: $PWD"
-          echo "Runner: $RUNNER_NAME"
-          echo "Build jobs: 1"
-          echo "Started: $(date -Is)"
-
-          start=$(date +%s)
-
-          python3 -u setup.py build LibCalls QuickSafe -j 1 \
-            2>&1 | tee "$QS_LOGS/quicksafe-build.log"
-
+          echo 'Building actual QuickSafe instrumentation and LibCalls target.'
+          python -u setup.py build LibCalls QuickSafe -j 1 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
           rc=${PIPESTATUS[0]}
-
-          elapsed=$(($(date +%s) - start))
-
-          echo "$rc" > "$QS_LOGS/build.exit"
-          echo "$elapsed" > "$QS_LOGS/build-duration.txt"
-
-          echo "Build exit code: $rc"
-          echo "Build duration: $elapsed seconds"
-
+          printf '%s\n' "$rc" > "$QS_LOGS/build.exit"
           exit "$rc"
 
-      - name: 06 - Run QuickSafe LibCalls test
+      - name: 06 - Run QuickSafe-instrumented LibCalls
         id: test
         if: steps.build.outcome == 'success'
         continue-on-error: true
         run: |
           set -uo pipefail
-
           cd "$QS_ROOT/source/quicksafe"
-
-          export PATH="$QS_ROOT/venv/bin:$PATH"
-
-          echo "=========================================="
-          echo "RUNNING QUICKSAFE LIBCALLS TEST"
-          echo "=========================================="
-
-          echo "Started: $(date -Is)"
-
-          start=$(date +%s)
-
-          python3 -u setup.py run LibCalls QuickSafe \
-            2>&1 | tee "$QS_LOGS/quicksafe-libcalls-test.log"
-
+          export PATH="$QS_VENV/bin:$PATH"
+          python -u setup.py run LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-libcalls-test.log"
           rc=${PIPESTATUS[0]}
-
-          elapsed=$(($(date +%s) - start))
-
-          echo "$rc" > "$QS_LOGS/test.exit"
-          echo "$elapsed" > "$QS_LOGS/test-duration.txt"
-
-          echo "Test exit code: $rc"
-          echo "Test duration: $elapsed seconds"
-
+          printf '%s\n' "$rc" > "$QS_LOGS/test.exit"
           exit "$rc"
 
-      - name: 07 - Print QuickSafe build and test report
+      - name: 07 - Print diagnostic report and precise failing stage
         if: always()
         run: |
           set +e
-
-          echo "=========================================="
-          echo "QUICKSAFE ORACLE v11 FINAL REPORT"
-          echo "=========================================="
-
+          echo '================ QUICKSAFE v13 REPORT ================'
           echo "Runner: $RUNNER_NAME"
-          echo "Build outcome: ${{ steps.build.outcome }}"
-          echo "Test outcome: ${{ steps.test.outcome }}"
-
-          echo "=== SOURCE COMMIT ==="
-          cat "$QS_LOGS/source-commit.txt" 2>/dev/null || true
-
-          echo "=== BUILD EXIT CODE ==="
-          cat "$QS_LOGS/build.exit" 2>/dev/null || true
-
-          echo "=== TEST EXIT CODE ==="
-          cat "$QS_LOGS/test.exit" 2>/dev/null || true
-
-          echo "=== BUILD LOG LAST 100 LINES ==="
-          tail -100 "$QS_LOGS/quicksafe-build.log" 2>/dev/null || true
-
-          echo "=== TEST LOG LAST 120 LINES ==="
-          tail -120 "$QS_LOGS/quicksafe-libcalls-test.log" 2>/dev/null || true
-
-          echo "=== MEMORY ==="
+          echo "Python setup: ${{ steps.python_setup.outcome }}"
+          echo "Build: ${{ steps.build.outcome }}"
+          echo "Test: ${{ steps.test.outcome }}"
+          for name in import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log; do
+            echo "--- $name (last 100 lines) ---"
+            tail -100 "$QS_LOGS/$name" 2>/dev/null || true
+          done
           free -h
-
-          echo "=== DISK ==="
           df -h "$QS_ROOT" || true
-
           {
-            echo '# QuickSafe Oracle v11'
-            echo ''
+            echo '# QuickSafe Oracle v13'
             echo "**Runner:** $RUNNER_NAME"
+            echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
             echo "**LibCalls test:** ${{ steps.test.outcome }}"
-            echo ''
-            echo '## Build log'
-            echo '```text'
-            tail -50 "$QS_LOGS/quicksafe-build.log" 2>/dev/null || true
-            echo '```'
-            echo ''
-            echo '## Test log'
-            echo '```text'
-            tail -50 "$QS_LOGS/quicksafe-libcalls-test.log" 2>/dev/null || true
-            echo '```'
+            echo "**Logs:** $QS_LOGS"
+            echo 'A passing build/test requires both commands to exit successfully.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 08 - Upload QuickSafe diagnostics
+      - name: 08 - Upload only this run's diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v11-${{ github.run_id }}
-          path: /home/ubuntu/quicksafe-work/ci-logs/
+          name: QuickSafe-oracle-v13-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
 
-      - name: 09 - Enforce QuickSafe build and test success
+      - name: 09 - Enforce actual setup build and test success
         if: always()
         run: |
           set -Eeuo pipefail
-
-          echo "=========================================="
-          echo "FINAL QUICKSAFE CI VERDICT"
-          echo "=========================================="
-
-          if [[ "${{ steps.build.outcome }}" != "success" ]]; then
-            echo "::error::QuickSafe build step did not succeed"
-            exit 1
-          fi
-
-          if [[ ! -f "$QS_LOGS/build.exit" ]]; then
-            echo "::error::QuickSafe build never completed"
-            exit 1
-          fi
-
-          if [[ "$(cat "$QS_LOGS/build.exit")" != "0" ]]; then
-            echo "::error::QuickSafe build failed"
-            exit 1
-          fi
-
-          if [[ "${{ steps.test.outcome }}" != "success" ]]; then
-            echo "::error::QuickSafe LibCalls test step did not succeed"
-            exit 1
-          fi
-
-          if [[ ! -f "$QS_LOGS/test.exit" ]]; then
-            echo "::error::QuickSafe test never completed"
-            exit 1
-          fi
-
-          if [[ "$(cat "$QS_LOGS/test.exit")" != "0" ]]; then
-            echo "::error::QuickSafe LibCalls test failed"
-            exit 1
-          fi
-
-          echo "PASS: QuickSafe build and LibCalls test completed successfully."
+          [[ "${{ steps.python_setup.outcome }}" == success ]] || { echo '::error::Python setup/import preflight failed; inspect Step 04'; exit 1; }
+          [[ "${{ steps.build.outcome }}" == success ]] || { echo '::error::QuickSafe build failed or skipped; inspect Step 05'; exit 1; }
+          [[ "${{ steps.test.outcome }}" == success ]] || { echo '::error::QuickSafe test failed or skipped; inspect Step 06'; exit 1; }
+          test -f "$QS_LOGS/build.exit" || { echo '::error::Missing build exit status'; exit 1; }
+          [[ "$(cat "$QS_LOGS/build.exit")" == 0 ]] || { echo '::error::Build returned nonzero'; exit 1; }
+          test -f "$QS_LOGS/test.exit" || { echo '::error::Missing test exit status'; exit 1; }
+          [[ "$(cat "$QS_LOGS/test.exit")" == 0 ]] || { echo '::error::Test returned nonzero'; exit 1; }
+          echo 'PASS: QuickSafe setup, build, and LibCalls run succeeded.'
