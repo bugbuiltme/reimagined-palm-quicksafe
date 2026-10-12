@@ -1,13 +1,13 @@
 
-name: QuickSafe-oracle v10 - Build and Test QuickSafe
-run-name: QuickSafe v10 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v11 - Build and Test QuickSafe
+run-name: QuickSafe v11 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v10.yml'
+      - '.github/workflows/QuickSafe-oracle-v11.yml'
 
 permissions:
   contents: read
@@ -31,6 +31,7 @@ jobs:
       QS_REPO: https://github.com/vusec/QuickSafe.git
       QS_REF: 515453512fc5e9991d5d9f71691a4fecd59f8f4f
       QS_LOGS: /home/ubuntu/quicksafe-work/ci-logs
+      PYTHONPATH: /home/ubuntu/quicksafe-work/source/quicksafe/infra
       PYTHONUNBUFFERED: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
@@ -40,7 +41,7 @@ jobs:
           set -Eeuo pipefail
 
           echo "=========================================="
-          echo "QUICKSAFE ORACLE v10"
+          echo "QUICKSAFE ORACLE v11"
           echo "=========================================="
 
           echo "Runner: $RUNNER_NAME"
@@ -64,6 +65,15 @@ jobs:
           fi
 
           mkdir -p "$QS_ROOT" "$QS_LOGS"
+
+          # Prevent previous runs from supplying false success results.
+          rm -f \
+            "$QS_LOGS/build.exit" \
+            "$QS_LOGS/test.exit" \
+            "$QS_LOGS/build-duration.txt" \
+            "$QS_LOGS/test-duration.txt" \
+            "$QS_LOGS/quicksafe-build.log" \
+            "$QS_LOGS/quicksafe-libcalls-test.log"
 
           echo "=== OPERATING SYSTEM ==="
           cat /etc/os-release
@@ -167,7 +177,7 @@ jobs:
           git submodule status --recursive \
             | tee "$QS_LOGS/submodules.txt"
 
-      - name: 04 - Prepare Python and install QuickSafe dependencies
+      - name: 04 - Prepare Python and verify QuickSafe infrastructure
         run: |
           set -Eeuo pipefail
 
@@ -178,35 +188,42 @@ jobs:
           python3 -m venv "$QS_ROOT/venv"
 
           PYTHON="$QS_ROOT/venv/bin/python"
+          INFRA="$QS_ROOT/source/quicksafe/infra"
 
           "$PYTHON" -m pip install \
             --upgrade pip setuptools wheel
 
-          # Fixes ModuleNotFoundError: No module named requests
+          # Fix missing Python dependency from v9.
           "$PYTHON" -m pip install \
             requests \
             packaging
 
-          INFRA="$QS_ROOT/source/quicksafe/infra"
-
-          # Install infrastructure dependencies if declared.
+          # Install infrastructure's declared dependencies if available.
           if [[ -f "$INFRA/pyproject.toml" || -f "$INFRA/setup.py" ]]; then
             "$PYTHON" -m pip install -e "$INFRA"
           fi
 
+          # Ensure Python finds quicksafe/infra/infra rather than
+          # treating quicksafe/infra as an empty namespace package.
+          export PYTHONPATH="$INFRA${PYTHONPATH:+:$PYTHONPATH}"
+
           echo "=== VERIFY REQUESTS ==="
           "$PYTHON" -c \
-            "import requests; print('requests version:', requests.__version__)"
+            "import requests; print('requests:', requests.__version__)"
 
-          echo "=== VERIFY QUICKSAFE INFRASTRUCTURE ==="
-          cd "$QS_ROOT/source/quicksafe"
-
+          echo "=== VERIFY INFRA PACKAGE LOCATION ==="
           "$PYTHON" -c \
-            "from infra import Setup; print('QuickSafe infrastructure import: PASS')"
+            "import infra; print('infra loaded from:', infra.__file__)"
+
+          echo "=== VERIFY QUICKSAFE SETUP ==="
+          "$PYTHON" -c \
+            "from infra import Setup; print('QuickSafe Setup: PASS')"
 
           echo "=== INSTALLED PYTHON PACKAGES ==="
           "$PYTHON" -m pip list \
             | tee "$QS_LOGS/python-packages.log"
+
+          cd "$QS_ROOT/source/quicksafe"
 
           echo "=== QUICKSAFE SETUP HELP ==="
           "$PYTHON" setup.py --help \
@@ -292,7 +309,7 @@ jobs:
           set +e
 
           echo "=========================================="
-          echo "QUICKSAFE ORACLE v10 FINAL REPORT"
+          echo "QUICKSAFE ORACLE v11 FINAL REPORT"
           echo "=========================================="
 
           echo "Runner: $RUNNER_NAME"
@@ -321,7 +338,7 @@ jobs:
           df -h "$QS_ROOT" || true
 
           {
-            echo '# QuickSafe Oracle v10'
+            echo '# QuickSafe Oracle v11'
             echo ''
             echo "**Runner:** $RUNNER_NAME"
             echo "**Build:** ${{ steps.build.outcome }}"
@@ -342,7 +359,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v10-${{ github.run_id }}
+          name: QuickSafe-oracle-v11-${{ github.run_id }}
           path: /home/ubuntu/quicksafe-work/ci-logs/
           if-no-files-found: warn
           retention-days: 30
@@ -356,6 +373,11 @@ jobs:
           echo "FINAL QUICKSAFE CI VERDICT"
           echo "=========================================="
 
+          if [[ "${{ steps.build.outcome }}" != "success" ]]; then
+            echo "::error::QuickSafe build step did not succeed"
+            exit 1
+          fi
+
           if [[ ! -f "$QS_LOGS/build.exit" ]]; then
             echo "::error::QuickSafe build never completed"
             exit 1
@@ -363,6 +385,11 @@ jobs:
 
           if [[ "$(cat "$QS_LOGS/build.exit")" != "0" ]]; then
             echo "::error::QuickSafe build failed"
+            exit 1
+          fi
+
+          if [[ "${{ steps.test.outcome }}" != "success" ]]; then
+            echo "::error::QuickSafe LibCalls test step did not succeed"
             exit 1
           fi
 
