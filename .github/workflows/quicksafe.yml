@@ -18,7 +18,7 @@ concurrency:
 jobs:
   quicksafe:
     name: Build QuickSafe and run LibCalls on Oracle
-    runs-on: [self-hosted, Linux, X64, quicksafe]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 720
     defaults:
       run:
