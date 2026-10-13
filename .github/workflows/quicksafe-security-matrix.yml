@@ -1,173 +1,197 @@
-name: QuickSafe real-handler regression
+name: QuickSafe two-defect real-runtime investigation
 on:
   workflow_dispatch:
   push:
     paths:
+      - '.github/workflows/quicksafe-two-defects.yml'
       - '**/Handlers.cpp'
       - '**/guard.cpp'
-      - '.github/workflows/quicksafe-security-matrix.yml'
-  pull_request:
-    paths:
-      - '**/Handlers.cpp'
-      - '**/guard.cpp'
-      - '.github/workflows/quicksafe-security-matrix.yml'
+      - '**/*quicksafe*.zip'
 permissions:
   contents: read
 jobs:
-  regression:
+  investigate:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        detect_mode: [OVERFLOW, UNDERFLOW]
+    env:
+      EVIDENCE: ${{ github.workspace }}/evidence
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install dependencies
+      - name: Install prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-16 llvm-16-dev libclang-16-dev lld-16 cmake ninja-build ccache pkg-config libxml2-dev libzstd-dev zlib1g-dev libunwind-dev python3
-      - name: Detect actual source root and record source evidence
+          sudo apt-get install -y clang-16 llvm-16-dev libclang-16-dev lld-16 cmake ninja-build ccache pkg-config libxml2-dev libzstd-dev zlib1g-dev libunwind-dev python3 gdb binutils
+          mkdir -p "$EVIDENCE"
+          uname -a | tee "$EVIDENCE/platform.txt"
+      - name: Locate real QuickSafe source, including committed archives
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence
-          pwd | tee evidence/pwd.txt
-          find . -maxdepth 5 -name Handlers.cpp -print | tee evidence/source-locations.txt
-          mapfile -t candidates < <(find . -maxdepth 5 -path '*/src/Handlers.cpp' -print)
-          if [ "${#candidates[@]}" -ne 1 ]; then
-            echo "Expected exactly one QuickSafe src/Handlers.cpp; found ${#candidates[@]}" >&2
-            exit 1
-          fi
-          src="${candidates[0]%/src/Handlers.cpp}"
-          test -f "$src/CMakeLists.txt"
-          test -f "$src/external/QuicksafeRT/src/guard.cpp"
-          printf 'QS_SOURCE=%s\n' "$src" >> "$GITHUB_ENV"
-          sha256sum "$src/src/Handlers.cpp" "$src/external/QuicksafeRT/src/guard.cpp" | tee evidence/source-hashes.txt
-          sed -n '/void \*__vp_handle_realloc_target(/,/^}/p' "$src/src/Handlers.cpp" > evidence/realloc-implementation.txt
-          sed -n '/void \*__vp_handle_reallocarray_target(/,/^}/p' "$src/src/Handlers.cpp" > evidence/reallocarray-implementation.txt
+          echo "Checkout: $PWD" | tee "$EVIDENCE/discovery.txt"
+          find . -maxdepth 4 -type f \( -name 'Handlers.cpp' -o -iname '*quicksafe*.zip' -o -name CMakeLists.txt \) | head -100 | tee -a "$EVIDENCE/discovery.txt"
+          python3 - <<'PY'
+          import os, pathlib, zipfile
+          root=pathlib.Path.cwd()
+          def valid(p):
+              return all((p/x).is_file() for x in ('CMakeLists.txt','src/Handlers.cpp','external/QuicksafeRT/src/guard.cpp'))
+          roots=[p.parent.parent for p in root.rglob('src/Handlers.cpp') if valid(p.parent.parent) and 'qs-build' not in p.parts]
+          if not roots:
+              archives=[p for p in root.rglob('*.zip') if 'quicksafe' in p.name.lower()]
+              print('QuickSafe archives:', [str(p) for p in archives])
+              if len(archives)==1:
+                  dest=pathlib.Path(os.environ['RUNNER_TEMP'])/'qs-unpacked';dest.mkdir()
+                  with zipfile.ZipFile(archives[0]) as z:
+                      for i in z.infolist():
+                          resolved=(dest/i.filename).resolve()
+                          if not resolved.is_relative_to(dest.resolve()) or i.file_size>1024**3:
+                              raise SystemExit('Unsafe archive member: '+i.filename)
+                      z.extractall(dest)
+                  roots=[p.parent.parent for p in dest.rglob('src/Handlers.cpp') if valid(p.parent.parent)]
+          roots=list(dict.fromkeys(p.resolve() for p in roots))
+          print('Validated roots:', [str(p) for p in roots])
+          if len(roots)!=1:
+              raise SystemExit('Need exactly one complete QuickSafe source tree or one committed QuickSafe ZIP; found '+str(len(roots)))
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write('QS_SOURCE='+str(roots[0])+'\n')
+          PY
+      - name: Preserve source and inspect exact statements
+        run: |
+          set -euo pipefail
+          sha256sum "$QS_SOURCE/src/Handlers.cpp" "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" | tee "$EVIDENCE/source-sha256.txt"
+          nl -ba "$QS_SOURCE/src/Handlers.cpp" | sed -n '155,225p' | tee "$EVIDENCE/handler-source.txt"
+          grep -nE 'guard_alloc\(|guard_realloc\(|is_guard_addr\(' "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" | head -60 | tee "$EVIDENCE/allocator-locations.txt"
       - name: Configure and build original libraries
-        shell: bash
         run: |
           set -euo pipefail
           cmake -S "$QS_SOURCE" -B "$RUNNER_TEMP/qs-build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=clang-16 -DCMAKE_CXX_COMPILER=clang++-16 \
+            -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-16 -DCMAKE_CXX_COMPILER=clang++-16 \
             -DLLVM_DIR=/usr/lib/llvm-16/lib/cmake/llvm \
-            2>&1 | tee evidence/configure.log
-          cmake --build "$RUNNER_TEMP/qs-build" --target QuickSafeHandlers --parallel 2 2>&1 | tee evidence/build.log
-          find "$RUNNER_TEMP/qs-build" -type f \( -name 'libQuickSafeHandlers.so' -o -name 'libQuicksafeRT.so' \) | tee evidence/libraries.txt
-      - name: Create direct real-handler tests
+            -DQUICKSAFE_USE_MTE=OFF -DQUICKSAFE_DETECT_MODE=${{ matrix.detect_mode }} \
+            2>&1 | tee "$EVIDENCE/configure.log"
+          cmake --build "$RUNNER_TEMP/qs-build" --target QuickSafeHandlers --parallel 2 2>&1 | tee "$EVIDENCE/build.log"
+          find "$RUNNER_TEMP/qs-build" -name '*.so' -print | tee "$EVIDENCE/libraries.txt"
+      - name: Generate direct-call regression harness
         shell: bash
         run: |
-          cat > "$RUNNER_TEMP/qs-test.cpp" <<'CPP'
+          cat > "$RUNNER_TEMP/two_cases.cpp" <<'CPP'
           #include <cstdio>
           #include <cstdlib>
           #include <cstring>
           #include <cstdint>
           #include <cerrno>
           #include <malloc.h>
-          #include <string>
-          extern "C" {
-            void* __vp_handle_realloc_target(void*, size_t);
-            void* __vp_handle_reallocarray_target(void*, size_t, size_t);
-            void* __vp_handle_reallocarray(void*, size_t, size_t);
-            void* __vp_handle_malloc_target(size_t);
-            void __vp_handle_free(void*);
-          }
-          int main(int argc, char** argv) {
-            if (argc != 2) return 2;
-            std::string t(argv[1]);
-            if (t == "libc_control_overflow") {
-              void* p = malloc(32); if (!p) return 3;
-              errno = 0;
-              void* q = __vp_handle_reallocarray(p, SIZE_MAX / 16 + 1, 16);
-              if (q) { __vp_handle_free(q); return 5; }
-              if (errno != ENOMEM) { free(p); return 6; }
-              memset(p, 0x42, 32); free(p);
-              puts("CONTROL_PASS: rejected overflow and preserved allocation");
+          #include <limits>
+          extern "C" void* __vp_handle_realloc_target(void*,size_t);
+          extern "C" void* __vp_handle_reallocarray_target(void*,size_t,size_t);
+          extern "C" void* __vp_handle_reallocarray(void*,size_t,size_t);
+          extern "C" void __vp_handle_free(void*);
+          int main(int argc,char**argv) {
+            setvbuf(stderr,nullptr,_IONBF,0);
+            if(argc!=2) return 90;
+            const char* mode=argv[1];
+            constexpr size_t old_requested=128;
+            void* p=malloc(old_requested);
+            if(!p) return 91;
+            memset(p,0x5a,old_requested);
+            const size_t usable=malloc_usable_size(p);
+            fprintf(stderr,"CASE=%s old_requested=%zu old_usable=%zu old_ptr=%p\n",mode,old_requested,usable,p);
+            void* q=nullptr;
+            errno=0;
+            if(strcmp(mode,"shrink_128_to_8")==0) {
+              fprintf(stderr,"CALL original __vp_handle_realloc_target(p,8)\n");
+              q=__vp_handle_realloc_target(p,8);
+            } else if(strcmp(mode,"array_overflow_zero")==0) {
+              size_t count=std::numeric_limits<size_t>::max()/16+1;
+              size_t element_size=16;
+              fprintf(stderr,"CALL original __vp_handle_reallocarray_target(p,%zu,%zu); wrapped_size=%zu\n",count,element_size,count*element_size);
+              q=__vp_handle_reallocarray_target(p,count,element_size);
+            } else if(strcmp(mode,"control_grow")==0) {
+              fprintf(stderr,"CALL original __vp_handle_realloc_target(p,256)\n");
+              q=__vp_handle_realloc_target(p,256);
+            } else if(strcmp(mode,"control_libc_overflow")==0) {
+              size_t count=std::numeric_limits<size_t>::max()/16+1;
+              fprintf(stderr,"CALL original __vp_handle_reallocarray(p,%zu,16)\n",count);
+              q=__vp_handle_reallocarray(p,count,16);
+              fprintf(stderr,"RETURN q=%p errno=%d (expected null and ENOMEM=%d)\n",q,errno,ENOMEM);
+              if(q) { __vp_handle_free(q); return 11; }
+              if(errno!=ENOMEM) { free(p); return 12; }
+              for(size_t i=0;i<old_requested;i++) if(((unsigned char*)p)[i]!=0x5a) {free(p);return 13;}
+              free(p);
               return 0;
-            }
-            if (t == "guarded_shrink" || t == "guarded_overflow") {
-              void* p = __vp_handle_malloc_target(128); if (!p) return 4;
-              memset(p, 0x41, 128);
-              void* q = t == "guarded_shrink"
-                ? __vp_handle_realloc_target(p, 8)
-                : __vp_handle_reallocarray_target(p, SIZE_MAX / 16 + 1, 16);
-              fprintf(stderr, "handler returned %p\n", q);
-              if (q) __vp_handle_free(q);
-              return 0; // No crash is inconclusive.
-            }
-            size_t old = 128;
-            if (t == "shrink_4096_1") old = 4096;
-            if (t == "padding_17_16") old = 17;
-            void* p = malloc(old); if (!p) return 3;
-            memset(p, 0x41, old);
-            fprintf(stderr, "requested=%zu usable=%zu\n", old, malloc_usable_size(p));
-            void* q = nullptr;
-            if (t == "shrink_128_8") q = __vp_handle_realloc_target(p, 8);
-            else if (t == "shrink_4096_1") q = __vp_handle_realloc_target(p, 1);
-            else if (t == "padding_17_16") q = __vp_handle_realloc_target(p, 16);
-            else if (t == "array_shrink") q = __vp_handle_reallocarray_target(p, 1, 8);
-            else if (t == "array_overflow_zero") q = __vp_handle_reallocarray_target(p, SIZE_MAX / 16 + 1, 16);
-            else if (t == "array_overflow_small") q = __vp_handle_reallocarray_target(p, SIZE_MAX / 16 + 2, 16);
-            else if (t == "null_realloc") { free(p); q = __vp_handle_realloc_target(nullptr, 32); }
-            else if (t == "zero_realloc") q = __vp_handle_realloc_target(p, 0);
-            else if (t == "grow") q = __vp_handle_realloc_target(p, 256);
-            else { free(p); return 2; }
-            fprintf(stderr, "handler returned %p\n", q);
-            if (q) __vp_handle_free(q);
-            return 0; // Explicitly inconclusive unless external detector reports fault.
+            } else { free(p);return 92; }
+            fprintf(stderr,"RETURN q=%p errno=%d\n",q,errno);
+            // Never use libc free on a QuickSafe guarded allocation.
+            // For a null return, original ownership may be ambiguous: avoid cleanup here.
+            // No return code establishes memory safety without an independent oracle.
+            return q?0:20;
           }
           CPP
-      - name: Link actual handler and runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          handlers="$(find "$RUNNER_TEMP/qs-build" -type f -name libQuickSafeHandlers.so -print -quit)"
-          runtime="$(find "$RUNNER_TEMP/qs-build" -type f -name libQuicksafeRT.so -print -quit)"
-          test -n "$handlers" && test -n "$runtime"
-          clang++-16 -std=c++20 -O0 -g "$RUNNER_TEMP/qs-test.cpp" "$handlers" \
-            -Wl,-rpath,"$(dirname "$handlers")" \
-            -Wl,-rpath,"$(dirname "$runtime")" \
-            -o "$RUNNER_TEMP/qs-test"
-          ldd "$RUNNER_TEMP/qs-test" | tee evidence/linkage.txt
-          ! grep -q 'not found' evidence/linkage.txt
-          nm -D "$handlers" | grep '__vp_handle_realloc' | tee evidence/handler-symbols.txt
-      - name: Run each case independently and retain outcomes
+          HANDLERS="$(find "$RUNNER_TEMP/qs-build" -name 'libQuickSafeHandlers.so' -print -quit)"
+          test -n "$HANDLERS"
+          clang++-16 -std=c++20 -O0 -g -fno-omit-frame-pointer -fno-builtin-memcpy \
+            "$RUNNER_TEMP/two_cases.cpp" "$HANDLERS" \
+            -Wl,-rpath,"$(dirname "$HANDLERS")" \
+            -o "$RUNNER_TEMP/two_cases"
+          ldd "$RUNNER_TEMP/two_cases" | tee "$EVIDENCE/ldd.txt"
+          if grep -q 'not found' "$EVIDENCE/ldd.txt"; then exit 1; fi
+          nm -D "$HANDLERS" | grep -E '__vp_handle_realloc(array)?_target' | tee "$EVIDENCE/symbols.txt"
+          cp "$RUNNER_TEMP/two_cases.cpp" "$EVIDENCE/harness.cpp"
+      - name: Execute isolated cases with backtraces and structured verdicts
         shell: bash
         run: |
           set -uo pipefail
           ulimit -c 0
-          echo 'case,exit,status' > evidence/results.csv
-          for t in libc_control_overflow shrink_128_8 shrink_4096_1 padding_17_16 array_shrink array_overflow_zero array_overflow_small guarded_shrink guarded_overflow null_realloc zero_realloc grow; do
-            echo "==== $t ===="
-            timeout 15s "$RUNNER_TEMP/qs-test" "$t" > "evidence/$t.log" 2>&1
-            rc=$?
-            if [ "$rc" -eq 124 ]; then status=TIMEOUT
-            elif [ "$rc" -ge 128 ]; then status=FAULT_OR_SIGNAL
-            elif [ "$rc" -eq 0 ] && [ "$t" = libc_control_overflow ]; then status=CONTROL_PASS
-            elif [ "$rc" -eq 0 ]; then status=INCONCLUSIVE
-            else status=NONZERO_EXIT
-            fi
-            printf '%s,%s,%s\n' "$t" "$rc" "$status" | tee -a evidence/results.csv
-            cat "evidence/$t.log"
-          done
-      - name: Summary
-        if: always()
-        shell: bash
-        run: |
-          echo '## QuickSafe original-code regression' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f evidence/results.csv ]; then
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat evidence/results.csv >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'Build or setup failed before runtime testing.' >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo 'Exit 0 for a target handler is inconclusive; no memory-boundary oracle is installed.' >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload evidence
+          export QS_BINARY="$RUNNER_TEMP/two_cases"
+          python3 - <<'PY'
+          import os, subprocess, pathlib, json, signal, time
+          out=pathlib.Path(os.environ['EVIDENCE'])
+          binary=os.environ['QS_BINARY']
+          names=['control_grow','control_libc_overflow','shrink_128_to_8','array_overflow_zero']
+          records=[]
+          for name in names:
+              print('\n'+'='*75+'\n'+name,flush=True)
+              started=time.monotonic()
+              try:
+                  p=subprocess.run([binary,name],capture_output=True,text=True,errors='replace',timeout=20)
+                  rc=p.returncode; log=p.stdout+p.stderr; timed_out=False
+              except subprocess.TimeoutExpired as e:
+                  rc=124;timed_out=True
+                  def decode(v):return v.decode(errors='replace') if isinstance(v,bytes) else (v or '')
+                  log=decode(e.stdout)+decode(e.stderr)
+              (out/(name+'.log')).write_text(log)
+              print(log[-12000:],flush=True)
+              if timed_out: classification='TIMEOUT_INCONCLUSIVE'
+              elif rc<0: classification='SIGNAL_'+signal.Signals(-rc).name
+              elif rc==0: classification='RETURNED_NO_MEMORY_SAFETY_PROOF'
+              else: classification='NONZERO_EXIT_'+str(rc)
+              if name=='control_libc_overflow' and rc==0: classification='CONTROL_REJECTED_OVERFLOW_AND_PRESERVED_SOURCE'
+              record={'case':name,'exit_code':rc,'classification':classification,'elapsed_seconds':round(time.monotonic()-started,3)}
+              records.append(record)
+              print(json.dumps(record),flush=True)
+              # Obtain a second-run debugger backtrace; it is not guaranteed to reproduce.
+              if name in ('shrink_128_to_8','array_overflow_zero'):
+                  cmd=['gdb','-q','-batch','-ex','set pagination off','-ex','set print thread-events off','-ex','run','-ex','bt full','-ex','info registers','--args',binary,name]
+                  try:
+                      d=subprocess.run(cmd,capture_output=True,text=True,errors='replace',timeout=35)
+                      (out/(name+'.gdb.txt')).write_text(d.stdout+'\n'+d.stderr)
+                  except subprocess.TimeoutExpired as e:
+                      (out/(name+'.gdb.txt')).write_text('Debugger timeout; inspect primary run\n')
+          (out/'results.json').write_text(json.dumps(records,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('## QuickSafe real handler results (${{ matrix.detect_mode }})\n\n')
+              f.write('| Case | Exit | Classification |\n|---|---:|---|\n')
+              for r in records:f.write(f"| {r['case']} | {r['exit_code']} | {r['classification']} |\n")
+              f.write('\nA signal alone does not prove an out-of-bounds write. Inspect `.gdb.txt` for the faulting instruction, allocator, and `memcpy` stack frame. A normal return is inconclusive.\n')
+          PY
+      - name: Upload all diagnostic evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: quicksafe-real-handler-evidence
+          name: quicksafe-two-defects-${{ matrix.detect_mode }}
           path: evidence/
           if-no-files-found: warn
