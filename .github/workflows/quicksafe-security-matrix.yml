@@ -48,7 +48,8 @@ jobs:
           git -C "$GITHUB_WORKSPACE/upstream-quicksafe" rev-parse HEAD | tee "$EVIDENCE/upstream-commit.txt"
           git -C "$GITHUB_WORKSPACE/upstream-quicksafe" submodule status --recursive | tee "$EVIDENCE/submodules.txt"
           echo "Checkout tree:"
-          find "$GITHUB_WORKSPACE/upstream-quicksafe" -maxdepth 3 -type f | head -100 | tee "$EVIDENCE/tree.txt"
+          find "$GITHUB_WORKSPACE/upstream-quicksafe/quicksafe" -maxdepth 3 -type f -print > "$EVIDENCE/tree-all.txt"
+          sed -n "1,100p" "$EVIDENCE/tree-all.txt" | tee "$EVIDENCE/tree.txt"
           for required in CMakeLists.txt src/Handlers.cpp external/QuicksafeRT/src/guard.cpp; do
             if [ ! -f "$QS_SOURCE/$required" ]; then
               echo "::error::Missing upstream file: $QS_SOURCE/$required"
@@ -62,7 +63,8 @@ jobs:
           set -euo pipefail
           sha256sum "$QS_SOURCE/src/Handlers.cpp" "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" | tee "$EVIDENCE/source-sha256.txt"
           nl -ba "$QS_SOURCE/src/Handlers.cpp" | sed -n '155,225p' | tee "$EVIDENCE/handler-source.txt"
-          grep -nE 'guard_alloc\(|guard_realloc\(|is_guard_addr\(' "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" | head -60 | tee "$EVIDENCE/allocator-locations.txt"
+          grep -nE 'guard_alloc\(|guard_realloc\(|is_guard_addr\(' "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" > "$EVIDENCE/allocator-locations-all.txt" || true
+          sed -n "1,60p" "$EVIDENCE/allocator-locations-all.txt" | tee "$EVIDENCE/allocator-locations.txt"
       - name: Configure and build original libraries
         run: |
           set -euo pipefail
