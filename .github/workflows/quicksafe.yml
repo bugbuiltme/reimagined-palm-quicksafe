@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v18 - Build and Test QuickSafe
-run-name: QuickSafe v18 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v19 - Build and Test QuickSafe
+run-name: QuickSafe v19 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v18.yml'
+      - '.github/workflows/QuickSafe-oracle-v19.yml'
 
 permissions:
   contents: read
@@ -54,7 +54,7 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git curl ca-certificates python3 python3-venv \
+            build-essential binutils file cmake ninja-build git curl ca-certificates python3 python3-venv \
             python3-dev python3-pip pkg-config clang lld llvm llvm-dev libelf-dev \
             libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev libedit-dev libncurses-dev \
             libunwind-dev libssl-dev ccache autoconf automake libtool bison flex \
@@ -250,29 +250,85 @@ jobs:
           printf '%s\n' "$rc" > "$QS_LOGS/test.exit"
           exit "$rc"
 
+      - name: 06b - Verify build artifacts and LLVM pass
+        id: artifacts
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          cd "$QS_ROOT/source/quicksafe"
+          BIN="$PWD/build/targets/LibCalls/bin/libcalls"
+          PASS="$PWD/build/packages/QuickSafePass/install/lib/libQuickSafe.so"
+          test -s "$BIN"
+          test -x "$BIN"
+          test -s "$PASS"
+          file "$BIN" "$PASS" | tee "$QS_LOGS/artifact-types.log"
+          file "$BIN" | grep -q 'ELF 64-bit'
+          file "$PASS" | grep -q 'ELF 64-bit'
+          readelf -h "$BIN" > "$QS_LOGS/libcalls-elf.log"
+          ldd "$BIN" | tee "$QS_LOGS/libcalls-ldd.log"
+          ! grep -q 'not found' "$QS_LOGS/libcalls-ldd.log"
+          grep -q 'Successfully built QuickSafePass!' "$QS_LOGS/quicksafe-build.log"
+          grep -q 'Build of LibCalls finished (QuickSafe)' "$QS_LOGS/quicksafe-build.log"
+          grep -q 'Running QuickSafe on:' "$QS_LOGS/quicksafe-build.log"
+          echo 'PASS: binary, plugin, ELF, shared libraries, and build evidence.'
+
+      - name: 06c - Three independent LibCalls smoke tests
+        id: smoke
+        if: steps.test.outcome == 'success' && steps.artifacts.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          BIN="$QS_ROOT/source/quicksafe/build/targets/LibCalls/bin/libcalls"
+          for i in 1 2 3; do
+            timeout 45s "$BIN" "quicksafe-smoke-$i" 2>&1 | tee "$QS_LOGS/smoke-$i.log"
+            grep -q '^Got 2 arguments$' "$QS_LOGS/smoke-$i.log"
+            grep -q "^Arg 1: quicksafe-smoke-$i$" "$QS_LOGS/smoke-$i.log"
+            grep -q '^Random string:' "$QS_LOGS/smoke-$i.log"
+            grep -q '^Second random string:' "$QS_LOGS/smoke-$i.log"
+          done
+          echo 'PASS: all three smoke tests.'
+
+      - name: 06d - Report instrumentation coverage limitation
+        id: coverage
+        if: steps.build.outcome == 'success'
+        run: |
+          set -Eeuo pipefail
+          if grep -Fq 'No targets found in $VP_TARGETS_STR; skipping...' "$QS_LOGS/quicksafe-build.log"; then
+            echo 'NOT VERIFIED: target-specific protection skipped because VP_TARGETS_STR has no matching targets.' | tee "$QS_LOGS/coverage.txt"
+            echo '::warning::Instrumentation plugin loaded, but target-specific memory protection was not exercised.'
+          else
+            echo 'QuickSafe pass ran; target-specific coverage requires further validation.' | tee "$QS_LOGS/coverage.txt"
+          fi
+
       - name: 07 - Print diagnostic report and precise failing stage
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v18 REPORT ================'
+          echo '================ QUICKSAFE v19 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "LLVM 16: ${{ steps.llvm16.outcome }}"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
           echo "Build: ${{ steps.build.outcome }}"
           echo "Test: ${{ steps.test.outcome }}"
-          for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log; do
+          echo "Artifact checks: ${{ steps.artifacts.outcome }}"
+          echo "Smoke tests: ${{ steps.smoke.outcome }}"
+          for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log coverage.txt smoke-1.log smoke-2.log smoke-3.log; do
             echo "--- $name (last 100 lines) ---"
             tail -100 "$QS_LOGS/$name" 2>/dev/null || true
           done
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v18'
+            echo '# QuickSafe Oracle v19'
             echo "**Runner:** $RUNNER_NAME"
             echo "**LLVM 16:** ${{ steps.llvm16.outcome }}"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
             echo "**LibCalls test:** ${{ steps.test.outcome }}"
+            echo "**Artifact checks:** ${{ steps.artifacts.outcome }}"
+            echo "**Smoke tests:** ${{ steps.smoke.outcome }}"
+            if [[ -f "$QS_LOGS/coverage.txt" ]]; then cat "$QS_LOGS/coverage.txt"; fi
             echo "**Logs:** $QS_LOGS"
             echo 'Build/test logs are checked for swallowed Python tracebacks as well as exit status.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -281,7 +337,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v18-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v19-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
@@ -298,4 +354,8 @@ jobs:
           [[ "$(cat "$QS_LOGS/build.exit")" == 0 ]] || { echo '::error::Build returned nonzero'; exit 1; }
           test -f "$QS_LOGS/test.exit" || { echo '::error::Missing test exit status'; exit 1; }
           [[ "$(cat "$QS_LOGS/test.exit")" == 0 ]] || { echo '::error::Test returned nonzero'; exit 1; }
-          echo 'PASS: QuickSafe setup, build, and LibCalls run succeeded.'
+          [[ "${{ steps.artifacts.outcome }}" == success ]] || { echo '::error::Artifact checks failed'; exit 1; }
+          [[ "${{ steps.smoke.outcome }}" == success ]] || { echo '::error::Smoke tests failed'; exit 1; }
+          [[ "${{ steps.coverage.outcome }}" == success ]] || { echo '::error::Coverage classification failed'; exit 1; }
+          echo 'PASS: QuickSafe build, LibCalls execution, artifacts and three smoke tests.'
+          echo 'NOTE: Target-specific protection remains unverified when VP_TARGETS_STR has no targets.'
