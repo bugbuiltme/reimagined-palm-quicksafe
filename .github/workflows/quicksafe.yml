@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v15 - Build and Test QuickSafe
-run-name: QuickSafe v15 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v16 - Build and Test QuickSafe
+run-name: QuickSafe v16 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v15.yml'
+      - '.github/workflows/QuickSafe-oracle-v16.yml'
 
 permissions:
   contents: read
@@ -93,7 +93,7 @@ jobs:
           INFRA="$QS_ROOT/source/quicksafe/infra"
           "$PYTHON" -m pip install --upgrade pip setuptools wheel
           # Confirmed missing in earlier CI traces; packaging used by tooling.
-          "$PYTHON" -m pip install requests sympy packaging
+          "$PYTHON" -m pip install requests sympy packaging argcomplete coloredlogs
           if [[ -f "$INFRA/pyproject.toml" || -f "$INFRA/setup.py" ]]; then
             "$PYTHON" -m pip install -e "$INFRA"
           fi
@@ -145,11 +145,15 @@ jobs:
           import sys
           import requests
           import sympy
+          import argcomplete
+          import coloredlogs
           import infra
           from infra import Setup
           print('Python:', sys.version)
           print('requests:', requests.__version__)
           print('sympy:', sympy.__version__)
+          print('argcomplete:', argcomplete.__file__)
+          print('coloredlogs:', coloredlogs.__file__)
           print('infra:', infra.__file__)
           print('Setup:', Setup)
           print('QuickSafe Python imports: PASS')
@@ -189,7 +193,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v15 REPORT ================'
+          echo '================ QUICKSAFE v16 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
           echo "Build: ${{ steps.build.outcome }}"
@@ -201,7 +205,7 @@ jobs:
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v15'
+            echo '# QuickSafe Oracle v16'
             echo "**Runner:** $RUNNER_NAME"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
@@ -214,7 +218,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v15-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v16-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
