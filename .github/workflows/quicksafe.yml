@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v19 - Build and Test QuickSafe
-run-name: QuickSafe v19 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v20 - Build and Test QuickSafe
+run-name: QuickSafe v20 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v19.yml'
+      - '.github/workflows/QuickSafe-oracle-v20.yml'
 
 permissions:
   contents: read
@@ -222,7 +222,10 @@ jobs:
           export PATH="$QS_VENV/bin:$PATH"
           export CMAKE_BUILD_PARALLEL_LEVEL=1
           export MAKEFLAGS=-j1
-          echo 'Building actual QuickSafe instrumentation and LibCalls target.'
+          # Force a fresh target compile rather than reusing v18/v19 Ninja outputs.
+          # Preserve downloaded sources and package caches for this low-memory runner.
+          rm -rf build/targets/LibCalls/build build/targets/LibCalls/bin
+          echo 'Building fresh QuickSafe instrumentation and LibCalls target.'
           python -u setup.py -j 1 build LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
           rc=${PIPESTATUS[0]}
           # This revision of infra.setup may print a traceback but exit zero.
@@ -250,7 +253,7 @@ jobs:
           printf '%s\n' "$rc" > "$QS_LOGS/test.exit"
           exit "$rc"
 
-      - name: 06b - Verify build artifacts and LLVM pass
+      - name: 06b - Locate QuickSafe runtime libraries and verify artifacts
         id: artifacts
         if: steps.build.outcome == 'success'
         continue-on-error: true
@@ -266,12 +269,31 @@ jobs:
           file "$BIN" | grep -q 'ELF 64-bit'
           file "$PASS" | grep -q 'ELF 64-bit'
           readelf -h "$BIN" > "$QS_LOGS/libcalls-elf.log"
+          # Discover both libraries in the same QuickSafe build/install tree.
+          # Do not accept similarly named libraries from arbitrary system paths.
+          RUNTIME_DIR=''
+          while IFS= read -r -d '' lib; do
+            dir="$(dirname "$lib")"
+            if [[ -s "$dir/libQuicksafeRT.so" && -s "$dir/libQuickSafeHandlers.so" ]]; then
+              RUNTIME_DIR="$dir"
+              break
+            fi
+          done < <(find "$PWD/build/packages/QuickSafePass" -type f -name 'libQuicksafeRT.so' -print0)
+          [[ -n "$RUNTIME_DIR" ]] || { echo '::error::QuickSafe runtime and handlers libraries not found together'; exit 1; }
+          printf '%s\n' "$RUNTIME_DIR" | tee "$QS_LOGS/runtime-library-dir.txt"
+          file "$RUNTIME_DIR/libQuicksafeRT.so" "$RUNTIME_DIR/libQuickSafeHandlers.so" | tee "$QS_LOGS/runtime-library-types.log"
+          export LD_LIBRARY_PATH="$RUNTIME_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           ldd "$BIN" | tee "$QS_LOGS/libcalls-ldd.log"
           ! grep -q 'not found' "$QS_LOGS/libcalls-ldd.log"
+          for name in libQuicksafeRT.so libQuickSafeHandlers.so; do
+            grep -F "$name => $RUNTIME_DIR/$name" "$QS_LOGS/libcalls-ldd.log"
+          done
           grep -q 'Successfully built QuickSafePass!' "$QS_LOGS/quicksafe-build.log"
           grep -q 'Build of LibCalls finished (QuickSafe)' "$QS_LOGS/quicksafe-build.log"
+          grep -q 'Run Build Command(s):' "$QS_LOGS/quicksafe-build.log"
+          grep -q '\[1/2\]' "$QS_LOGS/quicksafe-build.log"
           grep -q 'Running QuickSafe on:' "$QS_LOGS/quicksafe-build.log"
-          echo 'PASS: binary, plugin, ELF, shared libraries, and build evidence.'
+          echo 'PASS: fresh compile, pass invocation, binary, plugin, and runtime libraries.'
 
       - name: 06c - Three independent LibCalls smoke tests
         id: smoke
@@ -280,6 +302,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           BIN="$QS_ROOT/source/quicksafe/build/targets/LibCalls/bin/libcalls"
+          RUNTIME_DIR="$(cat "$QS_LOGS/runtime-library-dir.txt")"
+          [[ -s "$RUNTIME_DIR/libQuicksafeRT.so" && -s "$RUNTIME_DIR/libQuickSafeHandlers.so" ]]
+          export LD_LIBRARY_PATH="$RUNTIME_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           for i in 1 2 3; do
             timeout 45s "$BIN" "quicksafe-smoke-$i" 2>&1 | tee "$QS_LOGS/smoke-$i.log"
             grep -q '^Got 2 arguments$' "$QS_LOGS/smoke-$i.log"
@@ -287,7 +312,7 @@ jobs:
             grep -q '^Random string:' "$QS_LOGS/smoke-$i.log"
             grep -q '^Second random string:' "$QS_LOGS/smoke-$i.log"
           done
-          echo 'PASS: all three smoke tests.'
+          echo 'PASS: all three standalone smoke tests.'
 
       - name: 06d - Report instrumentation coverage limitation
         id: coverage
@@ -298,14 +323,14 @@ jobs:
             echo 'NOT VERIFIED: target-specific protection skipped because VP_TARGETS_STR has no matching targets.' | tee "$QS_LOGS/coverage.txt"
             echo '::warning::Instrumentation plugin loaded, but target-specific memory protection was not exercised.'
           else
-            echo 'QuickSafe pass ran; target-specific coverage requires further validation.' | tee "$QS_LOGS/coverage.txt"
+            echo 'QuickSafe pass ran during fresh build; target-specific coverage requires further validation.' | tee "$QS_LOGS/coverage.txt"
           fi
 
       - name: 07 - Print diagnostic report and precise failing stage
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v19 REPORT ================'
+          echo '================ QUICKSAFE v20 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "LLVM 16: ${{ steps.llvm16.outcome }}"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
@@ -313,14 +338,14 @@ jobs:
           echo "Test: ${{ steps.test.outcome }}"
           echo "Artifact checks: ${{ steps.artifacts.outcome }}"
           echo "Smoke tests: ${{ steps.smoke.outcome }}"
-          for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log coverage.txt smoke-1.log smoke-2.log smoke-3.log; do
+          for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log libcalls-ldd.log runtime-library-dir.txt coverage.txt smoke-1.log smoke-2.log smoke-3.log; do
             echo "--- $name (last 100 lines) ---"
             tail -100 "$QS_LOGS/$name" 2>/dev/null || true
           done
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v19'
+            echo '# QuickSafe Oracle v20'
             echo "**Runner:** $RUNNER_NAME"
             echo "**LLVM 16:** ${{ steps.llvm16.outcome }}"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
@@ -337,7 +362,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v19-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v20-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
