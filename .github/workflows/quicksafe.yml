@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v17 - Build and Test QuickSafe
-run-name: QuickSafe v17 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v18 - Build and Test QuickSafe
+run-name: QuickSafe v18 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v17.yml'
+      - '.github/workflows/QuickSafe-oracle-v18.yml'
 
 permissions:
   contents: read
@@ -71,6 +71,7 @@ jobs:
           cd "$QS_ROOT/source"
           git fetch origin "$QS_REF" || git fetch origin
           git checkout --detach "$QS_REF"
+          git reset --hard "$QS_REF"
           [[ "$(git rev-parse HEAD)" == "$QS_REF" ]] || { echo '::error::Wrong source revision'; exit 1; }
           git -c url.https://github.com/.insteadOf=git@github.com: \
             submodule update --init --recursive --force
@@ -82,6 +83,57 @@ jobs:
           git submodule status --recursive | tee "$QS_LOGS/submodules.txt"
           find quicksafe/infra -maxdepth 3 \( -name 'requirements*.txt' -o -name 'pyproject.toml' -o -name 'setup.py' \) \
             -print | tee "$QS_LOGS/infra-dependency-files.txt"
+
+      - name: 03b - Resolve compatible LLVM 16 toolchain
+        id: llvm16
+        run: |
+          set -Eeuo pipefail
+          echo 'QuickSafe pinned setup.py requests LLVM 16.0.6.'
+          echo 'Checking available LLVM configurations (never substitute LLVM 18).'
+          command -v llvm-config || true
+          for bin in /usr/local/bin/llvm-config /usr/bin/llvm-config-16 /usr/lib/llvm-16/bin/llvm-config; do
+            if [[ -x "$bin" ]]; then echo "$bin: $("$bin" --version)"; fi
+          done
+          candidate=''
+          for bin in /usr/local/bin/llvm-config /usr/bin/llvm-config-16 /usr/lib/llvm-16/bin/llvm-config; do
+            if [[ -x "$bin" ]] && [[ "$("$bin" --version)" == 16.* ]]; then
+              candidate="$bin"
+              break
+            fi
+          done
+          if [[ -z "$candidate" ]]; then
+            echo 'LLVM 16 not found. Checking Ubuntu package availability.'
+            apt-cache policy llvm-16-dev | tee "$QS_LOGS/llvm16-apt-policy.txt"
+            if apt-cache policy llvm-16-dev | grep -Eq 'Candidate: \(none\)'; then
+              echo '::error::llvm-16-dev is unavailable from configured APT repositories. Install a compatible LLVM 16 toolchain before rerunning; LLVM 18 is not a safe replacement.'
+              exit 1
+            fi
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends llvm-16-dev clang-16 lld-16
+            candidate=/usr/bin/llvm-config-16
+          fi
+          [[ -x "$candidate" ]] || { echo '::error::LLVM 16 llvm-config executable missing'; exit 1; }
+          [[ "$("$candidate" --version)" == 16.* ]] || { echo '::error::Wrong LLVM version'; exit 1; }
+          for flag in --includedir --obj-root --bindir --libdir; do
+            dir="$("$candidate" "$flag")"
+            [[ -d "$dir" ]] || { echo "::error::LLVM $flag directory does not exist: $dir"; exit 1; }
+          done
+          echo "QS_LLVM_CONFIG=$candidate" >> "$GITHUB_ENV"
+          echo "Selected LLVM: $candidate ($("$candidate" --version))" | tee "$QS_LOGS/llvm16-selected.txt"
+          # setup.py hardcodes /usr/local/bin/llvm-config; change only that
+          # explicit path in this disposable checkout, not the system executable.
+          export QS_LLVM_CONFIG="$candidate"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import os
+          path = Path(os.environ['QS_ROOT']) / 'source/quicksafe/setup.py'
+          original = path.read_text()
+          old = 'llvm_config=Path("/usr/local/bin/llvm-config")'
+          if original.count(old) != 1:
+              raise SystemExit('Unexpected QuickSafe LLVM config declaration; refusing to patch')
+          path.write_text(original.replace(old, f'llvm_config=Path("{os.environ["QS_LLVM_CONFIG"]}")'))
+          print('Configured QuickSafe to use', os.environ['QS_LLVM_CONFIG'])
+          PYCODE
+          git -C "$QS_ROOT/source" diff -- quicksafe/setup.py | tee "$QS_LOGS/llvm16-setup-patch.diff"
 
       - name: 04 - Create fresh Python environment and verify imports
         id: python_setup
@@ -173,6 +225,11 @@ jobs:
           echo 'Building actual QuickSafe instrumentation and LibCalls target.'
           python -u setup.py -j 1 build LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
           rc=${PIPESTATUS[0]}
+          # This revision of infra.setup may print a traceback but exit zero.
+          if grep -Eq 'Traceback \(most recent call last\):|^unknown error$|^FileNotFoundError:|^ModuleNotFoundError:|^ImportError:' "$QS_LOGS/quicksafe-build.log"; then
+            echo '::error::Build printed an exception despite its process exit status'
+            rc=1
+          fi
           printf '%s\n' "$rc" > "$QS_LOGS/build.exit"
           exit "$rc"
 
@@ -186,6 +243,10 @@ jobs:
           export PATH="$QS_VENV/bin:$PATH"
           python -u setup.py run LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-libcalls-test.log"
           rc=${PIPESTATUS[0]}
+          if grep -Eq 'Traceback \(most recent call last\):|^unknown error$|^FileNotFoundError:|^ModuleNotFoundError:|^ImportError:' "$QS_LOGS/quicksafe-libcalls-test.log"; then
+            echo '::error::Test printed an exception despite its process exit status'
+            rc=1
+          fi
           printf '%s\n' "$rc" > "$QS_LOGS/test.exit"
           exit "$rc"
 
@@ -193,8 +254,9 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v17 REPORT ================'
+          echo '================ QUICKSAFE v18 REPORT ================'
           echo "Runner: $RUNNER_NAME"
+          echo "LLVM 16: ${{ steps.llvm16.outcome }}"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
           echo "Build: ${{ steps.build.outcome }}"
           echo "Test: ${{ steps.test.outcome }}"
@@ -205,20 +267,21 @@ jobs:
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v17'
+            echo '# QuickSafe Oracle v18'
             echo "**Runner:** $RUNNER_NAME"
+            echo "**LLVM 16:** ${{ steps.llvm16.outcome }}"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
             echo "**LibCalls test:** ${{ steps.test.outcome }}"
             echo "**Logs:** $QS_LOGS"
-            echo 'A passing build/test requires both commands to exit successfully.'
+            echo 'Build/test logs are checked for swallowed Python tracebacks as well as exit status.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 08 - Upload only this run's diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v17-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v18-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
@@ -227,6 +290,7 @@ jobs:
         if: always()
         run: |
           set -Eeuo pipefail
+          [[ "${{ steps.llvm16.outcome }}" == success ]] || { echo '::error::LLVM 16 setup failed; inspect Step 03b'; exit 1; }
           [[ "${{ steps.python_setup.outcome }}" == success ]] || { echo '::error::Python setup/import preflight failed; inspect Step 04'; exit 1; }
           [[ "${{ steps.build.outcome }}" == success ]] || { echo '::error::QuickSafe build failed or skipped; inspect Step 05'; exit 1; }
           [[ "${{ steps.test.outcome }}" == success ]] || { echo '::error::QuickSafe test failed or skipped; inspect Step 06'; exit 1; }
