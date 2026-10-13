@@ -1,5 +1,5 @@
-name: QuickSafe-oracle v21 - Build and Test QuickSafe
-run-name: QuickSafe v21 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v22 - Build and Test QuickSafe
+run-name: QuickSafe v22 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v21.yml'
+      - '.github/workflows/QuickSafe-oracle-v22.yml'
 
 permissions:
   contents: read
@@ -357,6 +357,112 @@ jobs:
           }
           echo 'PASS: pass activity, selector control, and runtime symbols checked.'
 
+      - name: 06e - Deep target-specific memory protection experiment (verbose)
+        id: deep_protection
+        if: steps.protection.outcome == 'success' && steps.smoke.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          cd "$QS_ROOT/source/quicksafe"
+          export PATH="$QS_VENV/bin:$PATH"
+          export CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1
+          export LD_LIBRARY_PATH="$(cat "$QS_LOGS/runtime-library-dir.txt")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export VP_MEMOBJ_TYPE=HEAP
+          mkdir -p "$QS_LOGS/deep-protection"
+          D="$QS_LOGS/deep-protection"
+          SRC="$PWD/build/targets/LibCalls/src/libcalls.cpp"
+          BIN="$PWD/build/targets/LibCalls/bin/libcalls"
+          cp "$SRC" "$D/original-libcalls.cpp"
+          trap 'cp "$D/original-libcalls.cpp" "$SRC"' EXIT
+          cat > "$SRC" <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <new>
+          // Deterministic heap allocation. Marker identifies exact selector line.
+          __attribute__((noinline,optnone)) int exercise(bool invalid) {
+              unsigned char *p = new unsigned char[32]; // QUICKSAFE_TARGET_ALLOC
+              if (!p) return 20;
+              for (int i=0;i<32;++i) p[i] = static_cast<unsigned char>(i);
+              std::printf("NORMAL_ACCESS_OK checksum=%u\n", (unsigned)p[31]);
+              std::fflush(stdout);
+              if (invalid) {
+                  std::puts("BEGIN_INTENTIONAL_OOB_WRITE");
+                  std::fflush(stdout);
+                  volatile unsigned char *vp = p;
+                  vp[4096] = 0xA5; // deliberate invalid write, isolated subprocess only
+                  std::puts("OOB_WRITE_RETURNED");
+                  std::fflush(stdout);
+              }
+              delete[] p;
+              return 0;
+          }
+          int main(int argc,char **argv) {
+              return exercise(argc > 1 && std::strcmp(argv[1],"invalid") == 0);
+          }
+          CPP
+          nl -ba "$SRC" | tee "$D/numbered-test-source.txt"
+          line="$(grep -n 'QUICKSAFE_TARGET_ALLOC' "$SRC" | cut -d: -f1)"
+          [[ "$line" =~ ^[0-9]+$ ]]
+          export VP_TARGETS_STR="$(realpath "$SRC");;$line"
+          printf 'VP_TARGETS_STR=%s\nVP_MEMOBJ_TYPE=%s\n' "$VP_TARGETS_STR" "$VP_MEMOBJ_TYPE" | tee "$D/selector.txt"
+          echo '=== Building plain clang control ==='
+          /usr/lib/llvm-16/bin/clang++ -O0 -g "$SRC" -o "$D/plain-control" 2>&1 | tee "$D/plain-compile.log"
+          echo '=== Force fresh instrumented target rebuild ==='
+          rm -rf build/targets/LibCalls/build build/targets/LibCalls/bin
+          set +e
+          python -u setup.py -j 1 build LibCalls QuickSafe > "$D/instrumented-build.log" 2>&1
+          build_rc=$?
+          set -e
+          cat "$D/instrumented-build.log"
+          printf '%s\n' "$build_rc" > "$D/build.exit"
+          [[ "$build_rc" -eq 0 ]] || { echo '::error::Instrumented target build returned nonzero'; exit 1; }
+          ! grep -Eq 'Traceback \(most recent call last\):|^FileNotFoundError:|^ModuleNotFoundError:' "$D/instrumented-build.log" || { echo '::error::Build traceback'; exit 1; }
+          grep -Fq "$VP_TARGETS_STR" "$D/instrumented-build.log" || { echo '::error::Selector did not reach QuickSafe'; exit 1; }
+          grep -q 'Parsed targeted source locations:' "$D/instrumented-build.log" || { echo '::error::Selector parsing not confirmed'; exit 1; }
+          grep -Eq 'Found [1-9][0-9]* targeted heap alloc\(s\)' "$D/instrumented-build.log" || { echo '::error::No targeted heap allocation found'; exit 1; }
+          grep -Eq 'Instrumenting [1-9][0-9]* targeted defsite\(s\)' "$D/instrumented-build.log" || { echo '::error::No target allocation instrumented'; exit 1; }
+          grep -q 'Finished running QuickSafe on:' "$D/instrumented-build.log" || { echo '::error::QuickSafe pass did not finish'; exit 1; }
+          [[ -x "$BIN" ]]
+          echo '=== Symbol/ELF/runtime checks ==='
+          file "$BIN" | tee "$D/instrumented-file.log"
+          ldd "$BIN" | tee "$D/instrumented-ldd.log"
+          nm -C "$BIN" > "$D/instrumented-nm.log" || true
+          echo '=== Normal-access controls ==='
+          timeout 20s "$D/plain-control" 2>&1 | tee "$D/plain-normal.log"
+          timeout 20s "$BIN" 2>&1 | tee "$D/instrumented-normal.log"
+          grep -q 'NORMAL_ACCESS_OK checksum=31' "$D/plain-normal.log"
+          grep -q 'NORMAL_ACCESS_OK checksum=31' "$D/instrumented-normal.log"
+          echo '=== Isolated invalid-access controls (never executed in runner shell) ==='
+          ulimit -c 0
+          set +e
+          timeout 20s "$D/plain-control" invalid > "$D/plain-invalid.log" 2>&1
+          plain_rc=$?
+          timeout 20s "$BIN" invalid > "$D/instrumented-invalid.log" 2>&1
+          protected_rc=$?
+          set -e
+          printf 'plain_invalid_exit=%s\ninstrumented_invalid_exit=%s\n' "$plain_rc" "$protected_rc" | tee "$D/invalid-exit-codes.txt"
+          cat "$D/plain-invalid.log" "$D/instrumented-invalid.log"
+          grep -q 'BEGIN_INTENTIONAL_OOB_WRITE' "$D/instrumented-invalid.log" || { echo '::error::Protected negative test did not reach invalid write'; exit 1; }
+          {
+            echo 'TARGET INSTRUMENTATION: VERIFIED (matching heap allocation and pass completion)'
+            echo 'NORMAL PROTECTED ACCESS: VERIFIED'
+            if [[ "$protected_rc" -eq 124 ]]; then
+              echo 'NEGATIVE TEST: TIMEOUT; protection behavior inconclusive'
+            elif [[ "$protected_rc" -ne 0 && "$plain_rc" -eq 0 ]]; then
+              echo 'NEGATIVE TEST: instrumented-only failure; evidence of protection, but cause requires runtime/trace confirmation'
+            elif [[ "$protected_rc" -ne 0 ]]; then
+              echo 'NEGATIVE TEST: instrumented binary failed; baseline also failed, so attribution is inconclusive'
+            else
+              echo 'NEGATIVE TEST: invalid write returned normally; prevention NOT demonstrated'
+            fi
+            echo 'Do not equate a generic crash with QuickSafe-specific enforcement.'
+          } | tee "$D/verdict.txt"
+          cat "$D/verdict.txt" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$protected_rc" -ne 124 ]] || exit 1
+          [[ "$protected_rc" -ne 0 && "$plain_rc" -eq 0 ]] || { echo '::error::Differential invalid-access prevention NOT demonstrated'; exit 1; }
+          echo 'PASS: matched allocation instrumented, normal access succeeds, and differential invalid access fails.'
+
       - name: 06d - Report instrumentation coverage limitation
         id: coverage
         if: steps.build.outcome == 'success'
@@ -373,7 +479,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v21 REPORT ================'
+          echo '================ QUICKSAFE v22 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "LLVM 16: ${{ steps.llvm16.outcome }}"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
@@ -382,6 +488,7 @@ jobs:
           echo "Artifact checks: ${{ steps.artifacts.outcome }}"
           echo "Smoke tests: ${{ steps.smoke.outcome }}"
           echo "Protection evidence: ${{ steps.protection.outcome }}"
+          echo "Deep protection: ${{ steps.deep_protection.outcome }}"
           for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log libcalls-ldd.log runtime-library-dir.txt coverage.txt smoke-1.log smoke-2.log smoke-3.log protection-evidence.log target-parser-references.txt; do
             echo "--- $name (last 100 lines) ---"
             tail -100 "$QS_LOGS/$name" 2>/dev/null || true
@@ -389,7 +496,7 @@ jobs:
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v21'
+            echo '# QuickSafe Oracle v22'
             echo "**Runner:** $RUNNER_NAME"
             echo "**LLVM 16:** ${{ steps.llvm16.outcome }}"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
@@ -398,6 +505,7 @@ jobs:
             echo "**Artifact checks:** ${{ steps.artifacts.outcome }}"
             echo "**Smoke tests:** ${{ steps.smoke.outcome }}"
             echo "**Protection evidence:** ${{ steps.protection.outcome }}"
+            echo "**Deep protection:** ${{ steps.deep_protection.outcome }}"
             if [[ -f "$QS_LOGS/coverage.txt" ]]; then cat "$QS_LOGS/coverage.txt"; fi
             echo "**Logs:** $QS_LOGS"
             echo 'Build/test logs are checked for swallowed Python tracebacks as well as exit status.'
@@ -407,7 +515,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v21-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v22-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
@@ -427,6 +535,7 @@ jobs:
           [[ "${{ steps.artifacts.outcome }}" == success ]] || { echo '::error::Artifact checks failed'; exit 1; }
           [[ "${{ steps.smoke.outcome }}" == success ]] || { echo '::error::Smoke tests failed'; exit 1; }
           [[ "${{ steps.protection.outcome }}" == success ]] || { echo '::error::Protection evidence checks failed'; exit 1; }
+          [[ "${{ steps.deep_protection.outcome }}" == success ]] || { echo '::error::Deep protection experiment failed; inspect deep-protection diagnostics'; exit 1; }
           [[ "${{ steps.coverage.outcome }}" == success ]] || { echo '::error::Coverage classification failed'; exit 1; }
           echo 'PASS: QuickSafe build, LibCalls execution, artifacts and three smoke tests.'
-          echo 'NOTE: Blocked-access behavior is not established by these tests; a target-specific negative test is still required.'
+          echo 'Deep protection experiment completed; see its verdict for security-specific attribution.'
