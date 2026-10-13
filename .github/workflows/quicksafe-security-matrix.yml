@@ -1,0 +1,988 @@
+
+name: QuickSafe - Comprehensive Real Runtime Security Tests
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "quicksafe/**"
+      - ".github/workflows/quicksafe-security-matrix.yml"
+  pull_request:
+    paths:
+      - "quicksafe/**"
+      - ".github/workflows/quicksafe-security-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  security-regression:
+    name: Real QuickSafe Runtime - ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_DIR: ${{ github.workspace }}/qs-security-build
+      TEST_DIR: ${{ github.workspace }}/qs-security-tests
+      LOG_DIR: ${{ github.workspace }}/qs-security-results
+
+    steps:
+      # ============================================================
+      # 1. CHECKOUT AND ENVIRONMENT
+      # ============================================================
+
+      - name: Checkout complete repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install compiler and build dependencies
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang-16 \
+            llvm-16 \
+            llvm-16-dev \
+            libclang-16-dev \
+            lld-16 \
+            cmake \
+            ninja-build \
+            ccache \
+            python3 \
+            pkg-config \
+            libxml2-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libunwind-dev \
+            binutils \
+            gdb \
+            file
+
+          mkdir -p "$TEST_DIR" "$LOG_DIR"
+
+          uname -a | tee "$LOG_DIR/system.txt"
+          clang++-16 --version | tee "$LOG_DIR/compiler.txt"
+          cmake --version | tee "$LOG_DIR/cmake.txt"
+
+      - name: Verify repository structure
+        run: |
+          set -euxo pipefail
+
+          test -f quicksafe/CMakeLists.txt
+          test -f quicksafe/src/Handlers.cpp
+          test -f quicksafe/external/QuicksafeRT/src/guard.cpp
+          test -f quicksafe/external/QuicksafeRT/src/guard.h
+
+          grep -q '__vp_handle_realloc_target' \
+            quicksafe/src/Handlers.cpp
+
+          grep -q '__vp_handle_reallocarray_target' \
+            quicksafe/src/Handlers.cpp
+
+          sha256sum \
+            quicksafe/src/Handlers.cpp \
+            quicksafe/external/QuicksafeRT/src/guard.cpp \
+            > "$LOG_DIR/source-sha256.txt"
+
+          cat "$LOG_DIR/source-sha256.txt"
+
+      # ============================================================
+      # 2. SOURCE-LEVEL REGRESSION CHECKS
+      # ============================================================
+
+      - name: Record exact vulnerable implementation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import os
+
+          source = Path(
+              "quicksafe/src/Handlers.cpp"
+          ).read_text()
+
+          functions = [
+              "__vp_handle_realloc_target",
+              "__vp_handle_reallocarray_target",
+              "__vp_handle_realloc",
+              "__vp_handle_reallocarray",
+          ]
+
+          output = []
+
+          for name in functions:
+              pattern = (
+                  r'\b' + re.escape(name)
+                  + r'\s*\([^;]*?\)\s*\{'
+              )
+              match = re.search(pattern, source, re.S)
+
+              if not match:
+                  raise RuntimeError(
+                      "Missing handler: " + name
+                  )
+
+              start = match.start()
+              opening = source.index("{", match.start())
+              depth = 0
+              end = None
+
+              for i in range(opening, len(source)):
+                  if source[i] == "{":
+                      depth += 1
+                  elif source[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+
+              if end is None:
+                  raise RuntimeError(
+                      "Unbalanced function: " + name
+                  )
+
+              body = source[start:end]
+              output.append(
+                  "\n===== " + name + " =====\n" + body
+              )
+
+          path = Path(os.environ["LOG_DIR"]) / "handlers.txt"
+          path.write_text("\n".join(output))
+
+          target = output[0]
+          array_target = output[1]
+
+          print("Checking known vulnerable patterns")
+
+          checks = {
+              "old usable size copied":
+                  "memcpy(new_ptr, ptr, old_size)" in target,
+
+              "unchecked target array multiplication":
+                  "nmemb * size" in array_target,
+
+              "target allocation uses real guard":
+                  "guard_alloc(size)" in target,
+
+              "guarded branch uses guard_realloc":
+                  "guard_realloc(ptr, size)" in target,
+          }
+
+          for name, present in checks.items():
+              print(f"{name}: {present}")
+
+          # These are observations, not proof of exploitability.
+          print("Source extraction completed.")
+          PY
+
+      # ============================================================
+      # 3. BUILD ORIGINAL QUICKSAFE CODE
+      # ============================================================
+
+      - name: Configure original CMake project
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            -S quicksafe \
+            -B "$BUILD_DIR" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-16 \
+            -DCMAKE_CXX_COMPILER=clang++-16 \
+            -DLLVM_DIR=/usr/lib/llvm-16/lib/cmake/llvm \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            2>&1 | tee "$LOG_DIR/configure.log"
+
+      - name: Build real runtime and handler library
+        run: |
+          set -euxo pipefail
+
+          cmake --build "$BUILD_DIR" \
+            --target QuickSafeHandlers \
+            --parallel 2 \
+            2>&1 | tee "$LOG_DIR/build.log"
+
+      - name: Verify real runtime linkage
+        run: |
+          set -euxo pipefail
+
+          HANDLERS="$(find "$BUILD_DIR" \
+            -type f -name 'libQuickSafeHandlers.so' \
+            -print -quit)"
+
+          RUNTIME="$(find "$BUILD_DIR" \
+            -type f -name 'libQuicksafeRT.so' \
+            -print -quit)"
+
+          test -n "$HANDLERS"
+          test -n "$RUNTIME"
+
+          echo "Handlers: $HANDLERS"
+          echo "Runtime: $RUNTIME"
+
+          nm -D "$HANDLERS" \
+            | grep '__vp_handle_realloc' \
+            | tee "$LOG_DIR/exported-symbols.txt"
+
+          ldd "$HANDLERS" \
+            | tee "$LOG_DIR/handler-dependencies.txt"
+
+          readelf -d "$HANDLERS" \
+            > "$LOG_DIR/handler-dynamic.txt"
+
+          if ! readelf -d "$HANDLERS" \
+            | grep -q 'libQuicksafeRT.so'; then
+            echo "ERROR: real runtime dependency missing"
+            exit 1
+          fi
+
+          if grep -q 'not found' \
+            "$LOG_DIR/handler-dependencies.txt"; then
+            echo "ERROR: unresolved shared library"
+            exit 1
+          fi
+
+      # ============================================================
+      # 4. GENERATE TEST PROGRAM
+      # ============================================================
+
+      - name: Generate comprehensive C++ test harness
+        run: |
+          cat > "$TEST_DIR/quicksafe_test.cpp" <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <cstddef>
+          #include <cerrno>
+          #include <climits>
+          #include <malloc.h>
+          #include <limits>
+          #include <string>
+
+          extern "C" {
+              void* __vp_handle_realloc_target(
+                  void*, size_t);
+
+              void* __vp_handle_reallocarray_target(
+                  void*, size_t, size_t);
+
+              void* __vp_handle_realloc(
+                  void*, size_t);
+
+              void* __vp_handle_reallocarray(
+                  void*, size_t, size_t);
+
+              void* __vp_handle_malloc_target(size_t);
+
+              void __vp_handle_free(void*);
+          }
+
+          static void log_case(
+              const char* name,
+              const char* detail)
+          {
+              fprintf(stderr,
+                  "\n[TEST] %s\n[DETAIL] %s\n",
+                  name, detail);
+              fflush(stderr);
+          }
+
+          static void* libc_buffer(size_t n)
+          {
+              void* p = malloc(n);
+              if (!p) {
+                  fprintf(stderr,
+                      "malloc(%zu) failed\n", n);
+                  exit(10);
+              }
+
+              memset(p, 0x41, n);
+              fprintf(stderr,
+                  "libc requested=%zu usable=%zu ptr=%p\n",
+                  n, malloc_usable_size(p), p);
+              return p;
+          }
+
+          static void report_result(void* p)
+          {
+              fprintf(stderr,
+                  "returned=%p errno=%d\n", p, errno);
+              fflush(stderr);
+          }
+
+          int main(int argc, char** argv)
+          {
+              if (argc != 2) return 2;
+
+              std::string test = argv[1];
+              void* p = nullptr;
+              void* q = nullptr;
+
+              // ----------------------------------------------------
+              // TARGET REALLOC: SHRINK BOUNDARIES
+              // ----------------------------------------------------
+
+              if (test == "shrink_128_to_8") {
+                  log_case(test.c_str(),
+                      "Original target handler: 128 -> 8");
+                  p = libc_buffer(128);
+                  q = __vp_handle_realloc_target(p, 8);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "shrink_4096_to_1") {
+                  log_case(test.c_str(),
+                      "Large shrink: 4096 -> 1");
+                  p = libc_buffer(4096);
+                  q = __vp_handle_realloc_target(p, 1);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "shrink_64_to_63") {
+                  log_case(test.c_str(),
+                      "One-byte logical shrink");
+                  p = libc_buffer(64);
+                  q = __vp_handle_realloc_target(p, 63);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "shrink_64_to_0") {
+                  log_case(test.c_str(),
+                      "Zero-size target realloc");
+                  p = libc_buffer(64);
+                  q = __vp_handle_realloc_target(p, 0);
+                  report_result(q);
+                  // Zero-size semantics are implementation-specific.
+                  return 0;
+              }
+
+              if (test == "equal_128") {
+                  log_case(test.c_str(),
+                      "Same requested allocation size");
+                  p = libc_buffer(128);
+                  q = __vp_handle_realloc_target(p, 128);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "grow_8_to_128") {
+                  log_case(test.c_str(),
+                      "Growing allocation");
+                  p = libc_buffer(8);
+                  q = __vp_handle_realloc_target(p, 128);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "usable_size_padding") {
+                  log_case(test.c_str(),
+                      "libc usable size may exceed requested size");
+                  p = libc_buffer(17);
+                  q = __vp_handle_realloc_target(p, 16);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              // ----------------------------------------------------
+              // REALLOCARRAY: MULTIPLICATION BOUNDARIES
+              // ----------------------------------------------------
+
+              if (test == "array_shrink") {
+                  log_case(test.c_str(),
+                      "Target reallocarray 128 -> 8");
+                  p = libc_buffer(128);
+                  q = __vp_handle_reallocarray_target(
+                      p, 1, 8);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "array_overflow_zero") {
+                  log_case(test.c_str(),
+                      "SIZE_MAX multiplication wraps to zero");
+                  p = libc_buffer(32);
+
+                  size_t count = SIZE_MAX / 16 + 1;
+                  size_t size = 16;
+
+                  fprintf(stderr,
+                      "count=%zu size=%zu wrapped=%zu\n",
+                      count, size, count * size);
+
+                  q = __vp_handle_reallocarray_target(
+                      p, count, size);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_overflow_small") {
+                  log_case(test.c_str(),
+                      "Multiplication wraps to small positive size");
+                  p = libc_buffer(128);
+
+                  size_t count = SIZE_MAX / 16 + 2;
+                  size_t size = 16;
+
+                  fprintf(stderr,
+                      "count=%zu size=%zu wrapped=%zu\n",
+                      count, size, count * size);
+
+                  q = __vp_handle_reallocarray_target(
+                      p, count, size);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_overflow_guarded") {
+                  log_case(test.c_str(),
+                      "Overflow with guarded source allocation");
+
+                  p = __vp_handle_malloc_target(64);
+                  if (!p) return 4;
+
+                  q = __vp_handle_reallocarray_target(
+                      p, SIZE_MAX / 16 + 1, 16);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_max_no_overflow") {
+                  log_case(test.c_str(),
+                      "Huge multiplication without overflow");
+
+                  p = libc_buffer(32);
+                  size_t count = SIZE_MAX / 16;
+                  q = __vp_handle_reallocarray_target(
+                      p, count, 16);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_zero_count") {
+                  log_case(test.c_str(),
+                      "Zero count, nonzero element size");
+                  p = libc_buffer(32);
+                  q = __vp_handle_reallocarray_target(
+                      p, 0, 16);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_zero_size") {
+                  log_case(test.c_str(),
+                      "Nonzero count, zero element size");
+                  p = libc_buffer(32);
+                  q = __vp_handle_reallocarray_target(
+                      p, 16, 0);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "array_one_by_one") {
+                  log_case(test.c_str(),
+                      "Minimum nonzero array allocation");
+                  p = libc_buffer(32);
+                  q = __vp_handle_reallocarray_target(
+                      p, 1, 1);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              // ----------------------------------------------------
+              // POINTER PROVENANCE
+              // ----------------------------------------------------
+
+              if (test == "guarded_shrink") {
+                  log_case(test.c_str(),
+                      "Guarded source -> guarded target");
+
+                  p = __vp_handle_malloc_target(128);
+                  if (!p) return 4;
+
+                  memset(p, 0x41, 128);
+
+                  q = __vp_handle_realloc_target(p, 8);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "guarded_grow") {
+                  log_case(test.c_str(),
+                      "Guarded source -> larger guarded target");
+
+                  p = __vp_handle_malloc_target(8);
+                  if (!p) return 4;
+
+                  memset(p, 0x41, 8);
+
+                  q = __vp_handle_realloc_target(p, 128);
+                  report_result(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "null_target_realloc") {
+                  log_case(test.c_str(),
+                      "Target realloc with nullptr");
+
+                  q = __vp_handle_realloc_target(
+                      nullptr, 32);
+                  report_result(q);
+                  return 0;
+              }
+
+              if (test == "null_target_array") {
+                  log_case(test.c_str(),
+                      "Target reallocarray with nullptr");
+
+                  q = __vp_handle_reallocarray_target(
+                      nullptr, 4, 8);
+                  report_result(q);
+                  return 0;
+              }
+
+              // ----------------------------------------------------
+              // ORIGINAL NON-TARGET HANDLERS AS CONTROLS
+              // ----------------------------------------------------
+
+              if (test == "control_libc_realloc") {
+                  log_case(test.c_str(),
+                      "Non-target realloc control");
+
+                  p = libc_buffer(128);
+                  q = __vp_handle_realloc(p, 8);
+                  report_result(q);
+
+                  if (q) free(q);
+                  return q ? 0 : 4;
+              }
+
+              if (test == "control_libc_array_overflow") {
+                  log_case(test.c_str(),
+                      "Non-target reallocarray overflow control");
+
+                  p = libc_buffer(32);
+
+                  errno = 0;
+                  q = __vp_handle_reallocarray(
+                      p, SIZE_MAX / 16 + 1, 16);
+
+                  report_result(q);
+
+                  if (q) {
+                      free(q);
+                      return 5;
+                  }
+
+                  // Standard reallocarray should reject overflow.
+                  if (errno != ENOMEM) {
+                      fprintf(stderr,
+                          "Unexpected errno=%d\n", errno);
+                      free(p);
+                      return 6;
+                  }
+
+                  // Failed reallocarray must preserve p.
+                  memset(p, 0x42, 32);
+                  free(p);
+                  return 0;
+              }
+
+              // ----------------------------------------------------
+              // ALLOCATION FAILURE
+              // ----------------------------------------------------
+
+              if (test == "huge_target_realloc") {
+                  log_case(test.c_str(),
+                      "Huge destination allocation");
+
+                  p = libc_buffer(64);
+
+                  q = __vp_handle_realloc_target(
+                      p, SIZE_MAX / 2);
+                  report_result(q);
+                  return 0;
+              }
+
+              // ----------------------------------------------------
+              // REPEATED REALLOCATIONS
+              // ----------------------------------------------------
+
+              if (test == "repeated_guarded_realloc") {
+                  log_case(test.c_str(),
+                      "Repeated guarded reallocations");
+
+                  p = __vp_handle_malloc_target(128);
+                  if (!p) return 4;
+
+                  const size_t sizes[] = {
+                      64, 32, 16, 8, 128, 256, 4, 1
+                  };
+
+                  for (size_t n : sizes) {
+                      fprintf(stderr,
+                          "Reallocating to %zu\n", n);
+
+                      q = __vp_handle_realloc_target(p, n);
+                      if (!q) {
+                          fprintf(stderr,
+                              "Reallocation failed\n");
+                          return 4;
+                      }
+                      p = q;
+                  }
+
+                  __vp_handle_free(p);
+                  return 0;
+              }
+
+              fprintf(stderr,
+                  "Unknown test: %s\n", test.c_str());
+              return 2;
+          }
+          CPP
+
+      # ============================================================
+      # 5. COMPILE AGAINST ORIGINAL LIBRARIES
+      # ============================================================
+
+      - name: Compile real-handler test executable
+        run: |
+          set -euxo pipefail
+
+          HANDLERS="$(find "$BUILD_DIR" \
+            -type f -name 'libQuickSafeHandlers.so' \
+            -print -quit)"
+
+          RUNTIME="$(find "$BUILD_DIR" \
+            -type f -name 'libQuicksafeRT.so' \
+            -print -quit)"
+
+          HANDLER_DIR="$(dirname "$HANDLERS")"
+          RUNTIME_DIR="$(dirname "$RUNTIME")"
+
+          clang++-16 \
+            -std=c++20 \
+            -O0 \
+            -g \
+            -fno-omit-frame-pointer \
+            -fno-builtin-memcpy \
+            "$TEST_DIR/quicksafe_test.cpp" \
+            "$HANDLERS" \
+            -Wl,-rpath,"$HANDLER_DIR" \
+            -Wl,-rpath,"$RUNTIME_DIR" \
+            -o "$TEST_DIR/quicksafe_test"
+
+          ldd "$TEST_DIR/quicksafe_test" \
+            | tee "$LOG_DIR/test-linkage.txt"
+
+          if grep -q 'not found' \
+            "$LOG_DIR/test-linkage.txt"; then
+            echo "Missing shared dependency"
+            exit 1
+          fi
+
+      # ============================================================
+      # 6. HARDWARE CAPABILITY REPORT
+      # ============================================================
+
+      - name: Inspect ARM64 MTE capabilities
+        run: |
+          set -uo pipefail
+
+          echo "Architecture:"
+          uname -m
+
+          echo "CPU features:"
+          grep -m 1 '^Features' /proc/cpuinfo || true
+
+          echo "MTE feature present:"
+          if grep -m 1 '^Features' /proc/cpuinfo \
+              | grep -qw mte; then
+            echo "MTE advertised by CPU"
+          else
+            echo "MTE not advertised"
+          fi
+
+          echo "Note: advertised CPU support does not"
+          echo "prove runtime tagging is active."
+
+      # ============================================================
+      # 7. EXECUTE EACH TEST IN A SEPARATE PROCESS
+      # ============================================================
+
+      - name: Execute complete regression matrix
+        run: |
+          set -uo pipefail
+          ulimit -c 0
+
+          export LD_LIBRARY_PATH="$BUILD_DIR:$BUILD_DIR/external/QuicksafeRT:${LD_LIBRARY_PATH:-}"
+
+          cat > "$TEST_DIR/run_matrix.py" <<'PY'
+          import csv
+          import json
+          import os
+          import signal
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ["TEST_DIR"])
+          logs = Path(os.environ["LOG_DIR"])
+          executable = root / "quicksafe_test"
+
+          cases = [
+              ("shrink_128_to_8", "unsafe-copy"),
+              ("shrink_4096_to_1", "unsafe-copy"),
+              ("shrink_64_to_63", "boundary"),
+              ("shrink_64_to_0", "zero-size"),
+              ("equal_128", "equal-size"),
+              ("grow_8_to_128", "growth"),
+              ("usable_size_padding", "allocator-padding"),
+
+              ("array_shrink", "unsafe-copy"),
+              ("array_overflow_zero", "integer-overflow"),
+              ("array_overflow_small", "integer-overflow"),
+              ("array_overflow_guarded", "guarded-overflow"),
+              ("array_max_no_overflow", "huge-allocation"),
+              ("array_zero_count", "zero-size"),
+              ("array_zero_size", "zero-size"),
+              ("array_one_by_one", "boundary"),
+
+              ("guarded_shrink", "guarded-path"),
+              ("guarded_grow", "guarded-path"),
+              ("null_target_realloc", "null-pointer"),
+              ("null_target_array", "null-pointer"),
+
+              ("control_libc_realloc", "control"),
+              ("control_libc_array_overflow", "control"),
+
+              ("huge_target_realloc", "allocation-failure"),
+              ("repeated_guarded_realloc", "repetition"),
+          ]
+
+          results = []
+
+          for name, category in cases:
+              print("=" * 65, flush=True)
+              print("Running:", name, flush=True)
+
+              started = time.monotonic()
+
+              env = os.environ.copy()
+
+              # Keep allocator diagnostics visible.
+              env["MALLOC_CHECK_"] = "3"
+
+              try:
+                  proc = subprocess.run(
+                      [str(executable), name],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      errors="replace",
+                      timeout=15,
+                      env=env,
+                  )
+                  output = proc.stdout
+                  rc = proc.returncode
+                  timed_out = False
+
+              except subprocess.TimeoutExpired as exc:
+                  output = exc.stdout or b""
+                  if isinstance(output, bytes):
+                      output = output.decode(
+                          "utf-8", errors="replace"
+                      )
+                  rc = 124
+                  timed_out = True
+
+              elapsed = time.monotonic() - started
+
+              (logs / f"{name}.log").write_text(output)
+
+              lowered = output.lower()
+
+              if timed_out:
+                  status = "TIMEOUT"
+              elif "addresssanitizer:" in lowered:
+                  status = "SANITIZER_REPORT"
+              elif "runtime error:" in lowered:
+                  status = "UBSAN_REPORT"
+              elif rc < 0:
+                  try:
+                      sig = signal.Signals(-rc).name
+                  except ValueError:
+                      sig = str(-rc)
+                  status = "SIGNAL_" + sig
+              elif rc == 0:
+                  status = "RETURNED_NO_PROOF_OF_SAFETY"
+              else:
+                  status = "NONZERO_EXIT"
+
+              record = {
+                  "test": name,
+                  "category": category,
+                  "status": status,
+                  "exit_code": rc,
+                  "seconds": round(elapsed, 3),
+                  "log": f"{name}.log",
+              }
+
+              results.append(record)
+
+              print(json.dumps(record), flush=True)
+
+          with (logs / "results.csv").open(
+              "w", newline=""
+          ) as f:
+              writer = csv.DictWriter(
+                  f, fieldnames=results[0].keys()
+              )
+              writer.writeheader()
+              writer.writerows(results)
+
+          (logs / "results.json").write_text(
+              json.dumps(results, indent=2)
+          )
+
+          print("\nFINAL SUMMARY")
+          for r in results:
+              print(
+                  f"{r['test']:35} "
+                  f"{r['status']:32} "
+                  f"exit={r['exit_code']}"
+              )
+
+          print("\nIMPORTANT:")
+          print("A normal return is NOT proof of memory safety.")
+          print("Faults must be correlated with their logs.")
+          print("Hardware MTE is not guaranteed on this runner.")
+          PY
+
+          python3 "$TEST_DIR/run_matrix.py" \
+            2>&1 | tee "$LOG_DIR/matrix-console.log"
+
+      # ============================================================
+      # 8. OPTIONAL ASYNC MTE CONFIGURATION
+      # ============================================================
+
+      - name: Test with asynchronous glibc MTE requested
+        run: |
+          set -uo pipefail
+
+          export GLIBC_TUNABLES="glibc.mem.tagging=1"
+
+          timeout 15s \
+            "$TEST_DIR/quicksafe_test" shrink_128_to_8 \
+            > "$LOG_DIR/mte-async.log" 2>&1
+
+          rc=$?
+
+          echo "Async MTE requested, exit=$rc" \
+            | tee -a "$LOG_DIR/mte-async.log"
+
+          echo "This does not establish MTE activation."
+
+      # ============================================================
+      # 9. OPTIONAL SYNC MTE CONFIGURATION
+      # ============================================================
+
+      - name: Test with synchronous glibc MTE requested
+        run: |
+          set -uo pipefail
+
+          export GLIBC_TUNABLES="glibc.mem.tagging=2"
+
+          timeout 15s \
+            "$TEST_DIR/quicksafe_test" shrink_128_to_8 \
+            > "$LOG_DIR/mte-sync.log" 2>&1
+
+          rc=$?
+
+          echo "Sync MTE requested, exit=$rc" \
+            | tee -a "$LOG_DIR/mte-sync.log"
+
+          echo "This does not establish MTE activation."
+
+      # ============================================================
+      # 10. PRODUCE GITHUB ACTIONS SUMMARY
+      # ============================================================
+
+      - name: Publish regression summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+
+          logs = Path(os.environ["LOG_DIR"])
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          with summary.open("a") as f:
+              f.write("# QuickSafe Real Runtime Security Tests\n\n")
+              f.write(
+                  "Tests call the original QuickSafe handler "
+                  "library and guarded runtime.\n\n"
+              )
+
+              path = logs / "results.csv"
+
+              if not path.exists():
+                  f.write(
+                      "**Test matrix did not complete.** "
+                      "Inspect build and setup logs.\n"
+                  )
+              else:
+                  f.write(
+                      "| Test | Category | Result | Exit |\n"
+                  )
+                  f.write("|---|---|---|---|\n")
+
+                  with path.open() as src:
+                      for row in csv.DictReader(src):
+                          f.write(
+                              f"| {row['test']} "
+                              f"| {row['category']} "
+                              f"| {row['status']} "
+                              f"| {row['exit_code']} |\n"
+                          )
+
+              f.write("\n## Interpretation\n\n")
+              f.write(
+                  "- Crashes require log inspection.\n"
+                  "- A normal return is inconclusive.\n"
+                  "- A rejected overflow is expected behavior.\n"
+                  "- An MTE tunable alone does not prove MTE is active.\n"
+                  "- This suite does not prove end-to-end "
+                  "LLVM instrumentation coverage.\n"
+              )
+          PY
+
+      # ============================================================
+      # 11. ALWAYS UPLOAD EVIDENCE
+      # ============================================================
+
+      - name: Upload complete test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quicksafe-comprehensive-security-evidence
+          path: |
+            qs-security-results/
+          if-no-files-found: warn
+          retention-days: 30
