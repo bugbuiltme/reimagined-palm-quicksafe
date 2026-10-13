@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v14 - Build and Test QuickSafe
-run-name: QuickSafe v14 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v15 - Build and Test QuickSafe
+run-name: QuickSafe v15 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v14.yml'
+      - '.github/workflows/QuickSafe-oracle-v15.yml'
 
 permissions:
   contents: read
@@ -100,35 +100,43 @@ jobs:
           if [[ -f "$INFRA/requirements.txt" ]]; then
             "$PYTHON" -m pip install -r "$INFRA/requirements.txt"
           fi
-          # Some pinned infra revisions import an optional SPEC2006 target even
-          # when the spec2006.py module is absent. LibCalls does not need SPEC.
-          # Apply a narrow, logged working-tree compatibility fix only in that case.
+          # Some pinned infra revisions refer to SPEC targets whose source files
+          # are absent. Only guard missing SPEC target modules, never arbitrary imports.
           export QS_INFRA_TARGETS="$INFRA/infra/targets"
-          "$PYTHON" - <<'PY' 2>&1 | tee "$QS_LOGS/optional-spec2006-fix.log"
+          "$PYTHON" - <<'PY' 2>&1 | tee "$QS_LOGS/optional-spec-targets-fix.log"
           from pathlib import Path
+          import ast
           import os
+          import re
           folder = Path(os.environ['QS_INFRA_TARGETS'])
           init = folder / '__init__.py'
-          missing = folder / 'spec2006.py'
-          if missing.exists():
-              print('SPEC2006 module exists: no compatibility change needed')
+          original = init.read_text()
+          lines = original.splitlines(keepends=True)
+          changed = []
+          pattern = re.compile(r'^(\s*)from \.(spec[0-9A-Za-z_]*) import ([A-Za-z_][A-Za-z_0-9]*)(\s*(?:#.*)?)$')
+          for i, line in enumerate(lines):
+              match = pattern.match(line.rstrip('\r\n'))
+              if not match:
+                  continue
+              indent, module, symbol, comment = match.groups()
+              if (folder / (module + '.py')).is_file() or (folder / module / '__init__.py').is_file():
+                  continue
+              # Do not swallow import failures within a module that exists.
+              lines[i] = (f'{indent}try:\n'
+                          f'{indent}    from .{module} import {symbol}{comment}\n'
+                          f'{indent}except ModuleNotFoundError as exc:\n'
+                          f'{indent}    if exc.name != __package__ + ".{module}":\n'
+                          f'{indent}        raise\n')
+              changed.append(module)
+          if changed:
+              candidate = ''.join(lines)
+              ast.parse(candidate, filename=str(init))
+              init.write_text(candidate)
+              print('Guarded absent optional SPEC modules:', ', '.join(changed))
           else:
-              original = init.read_text()
-              # Exact-match substitution prevents accidentally modifying other imports.
-              lines = original.splitlines(keepends=True)
-              hits = [i for i, line in enumerate(lines)
-                      if line.strip() == 'from .spec2006 import SPEC2006']
-              if len(hits) != 1:
-                  raise RuntimeError('Missing spec2006.py, but expected exactly one SPEC2006 import; refusing unsafe patch')
-              i = hits[0]
-              indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
-              lines[i] = (indent + 'try:\n' + indent + '    from .spec2006 import SPEC2006\n'
-                          + indent + 'except ModuleNotFoundError as exc:\n'
-                          + indent + '    if exc.name != __name__ + ".spec2006":\n'
-                          + indent + '        raise\n')
-              init.write_text(''.join(lines))
-              print('Guarded missing optional infra.targets.spec2006 import for LibCalls')
-              print('Modified:', init)
+              print('No absent SPEC target imports to guard')
+          print('SPEC target files:', sorted(p.name for p in folder.glob('spec*')))
+          print('Changed file:', init if changed else '(none)')
           PY
           "$PYTHON" -m pip check | tee "$QS_LOGS/pip-check.log"
           "$PYTHON" -m pip freeze | tee "$QS_LOGS/python-freeze.txt"
@@ -181,19 +189,19 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v14 REPORT ================'
+          echo '================ QUICKSAFE v15 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
           echo "Build: ${{ steps.build.outcome }}"
           echo "Test: ${{ steps.test.outcome }}"
-          for name in optional-spec2006-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log; do
+          for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log; do
             echo "--- $name (last 100 lines) ---"
             tail -100 "$QS_LOGS/$name" 2>/dev/null || true
           done
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v14'
+            echo '# QuickSafe Oracle v15'
             echo "**Runner:** $RUNNER_NAME"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
@@ -206,7 +214,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v14-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v15-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
