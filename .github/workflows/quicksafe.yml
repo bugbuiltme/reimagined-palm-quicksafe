@@ -1,5 +1,5 @@
-name: QuickSafe-oracle v22 - Build and Test QuickSafe
-run-name: QuickSafe v22 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v23 - Build and Test QuickSafe
+run-name: QuickSafe v23 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v22.yml'
+      - '.github/workflows/QuickSafe-oracle-v23.yml'
 
 permissions:
   contents: read
@@ -463,14 +463,152 @@ jobs:
           [[ "$protected_rc" -ne 0 && "$plain_rc" -eq 0 ]] || { echo '::error::Differential invalid-access prevention NOT demonstrated'; exit 1; }
           echo 'PASS: matched allocation instrumented, normal access succeeds, and differential invalid access fails.'
 
+      - name: 06f - Broad protection coverage matrix (heap bounds and lifetime)
+        id: broad_protection
+        if: steps.deep_protection.outcome == 'success'
+        run: |
+          set -Eeuo pipefail
+          cd "$QS_ROOT/source/quicksafe"
+          export PATH="$QS_VENV/bin:$PATH"
+          export CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1
+          export LD_LIBRARY_PATH="$(cat "$QS_LOGS/runtime-library-dir.txt")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export VP_MEMOBJ_TYPE=HEAP
+          D="$QS_LOGS/broad-protection"
+          mkdir -p "$D"
+          SRC="$PWD/build/targets/LibCalls/src/libcalls.cpp"
+          BIN="$PWD/build/targets/LibCalls/bin/libcalls"
+          cp "$SRC" "$D/original-libcalls.cpp"
+          trap 'cp "$D/original-libcalls.cpp" "$SRC"' EXIT
+          cat > "$SRC" <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <new>
+          __attribute__((noinline,optnone)) int probe(const char *mode, unsigned long offset) {
+              unsigned char *p = new unsigned char[32]; // QUICKSAFE_BROAD_ALLOC
+              for (int i=0; i<32; ++i) p[i] = static_cast<unsigned char>(i);
+              std::printf("NORMAL_ACCESS_OK checksum=%u\n", (unsigned)p[31]);
+              std::fflush(stdout);
+              if (std::strcmp(mode,"normal") == 0) { delete[] p; return 0; }
+              if (std::strcmp(mode,"oob") == 0) {
+                  std::printf("ATTEMPT_OOB offset=%lu\n", offset); std::fflush(stdout);
+                  volatile unsigned char *v = p;
+                  v[offset] = 0xA5;
+                  std::puts("INVALID_ACCESS_RETURNED"); std::fflush(stdout);
+                  delete[] p;
+                  return 0;
+              }
+              if (std::strcmp(mode,"uaf") == 0) {
+                  delete[] p;
+                  std::puts("ATTEMPT_USE_AFTER_FREE"); std::fflush(stdout);
+                  volatile unsigned char *v = p;
+                  v[0] = 0xA5;
+                  std::puts("INVALID_ACCESS_RETURNED"); std::fflush(stdout);
+                  return 0;
+              }
+              if (std::strcmp(mode,"doublefree") == 0) {
+                  delete[] p;
+                  std::puts("ATTEMPT_DOUBLE_FREE"); std::fflush(stdout);
+                  delete[] p;
+                  std::puts("INVALID_ACCESS_RETURNED"); std::fflush(stdout);
+                  return 0;
+              }
+              delete[] p; return 50;
+          }
+          int main(int argc,char **argv) {
+              const char *mode = argc > 1 ? argv[1] : "normal";
+              unsigned long offset = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 0;
+              return probe(mode, offset);
+          }
+          CPP
+          nl -ba "$SRC" | tee "$D/numbered-source.txt"
+          line="$(grep -n 'QUICKSAFE_BROAD_ALLOC' "$SRC" | cut -d: -f1)"
+          export VP_TARGETS_STR="$(realpath "$SRC");;$line"
+          printf 'VP_TARGETS_STR=%s\nVP_MEMOBJ_TYPE=%s\n' "$VP_TARGETS_STR" "$VP_MEMOBJ_TYPE" | tee "$D/selector.txt"
+          /usr/lib/llvm-16/bin/clang++ -O0 -g "$SRC" -o "$D/plain-control" 2>&1 | tee "$D/plain-build.log"
+          rm -rf build/targets/LibCalls/build build/targets/LibCalls/bin
+          set +e
+          python -u setup.py -j 1 build LibCalls QuickSafe > "$D/instrumented-build.log" 2>&1
+          build_rc=$?
+          set -e
+          cat "$D/instrumented-build.log"
+          [[ "$build_rc" -eq 0 ]] || { echo '::error::Broad matrix instrumented build failed'; exit 1; }
+          grep -Fq "$VP_TARGETS_STR" "$D/instrumented-build.log"
+          grep -Eq 'Found [1-9][0-9]* targeted heap alloc\(s\)' "$D/instrumented-build.log"
+          grep -Eq 'Instrumenting [1-9][0-9]* targeted defsite\(s\)' "$D/instrumented-build.log"
+          grep -q 'Finished running QuickSafe on:' "$D/instrumented-build.log"
+          [[ -x "$BIN" ]]
+          file "$BIN" | tee "$D/instrumented-file.log"
+          ldd "$BIN" | tee "$D/instrumented-ldd.log"
+          export QS_BROAD_BIN="$BIN" QS_BROAD_DIR="$D"
+          python3 - <<'PYMATRIX'
+          import csv, json, os, subprocess
+          from pathlib import Path
+          d = Path(os.environ['QS_BROAD_DIR'])
+          binaries = {'plain': str(d/'plain-control'), 'protected': os.environ['QS_BROAD_BIN']}
+          cases = [('normal',None)] + [('oob',n) for n in (32,33,40,48,63,64,96,128,256,512,1024,2048,4096,8192,16384)] + [('uaf',None),('doublefree',None)]
+          records=[]
+          for case, offset in cases:
+              label = case if offset is None else f'{case}-{offset}'
+              row={'case':case,'offset':offset,'label':label}
+              for kind,binary in binaries.items():
+                  args=[binary,case]+([str(offset)] if offset is not None else [])
+                  try:
+                      p=subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15, text=True, errors='replace', cwd=d)
+                      rc=p.returncode; out=p.stdout
+                  except subprocess.TimeoutExpired as exc:
+                      rc=124; out=(exc.stdout or b'').decode(errors='replace') if isinstance(exc.stdout,bytes) else (exc.stdout or '')
+                  (d/f'{label}-{kind}.log').write_text(out)
+                  row[kind+'_exit']=rc
+                  row[kind+'_returned']='INVALID_ACCESS_RETURNED' in out
+                  row[kind+'_quicksafe_handler']='[QuickSafeRT] Caught SIGSEGV' in out
+                  row[kind+'_normal_ok']='NORMAL_ACCESS_OK checksum=31' in out
+              if case=='normal':
+                  verdict='PASS_NORMAL' if all(row[k+'_exit']==0 and row[k+'_normal_ok'] for k in binaries) else 'FAIL_NORMAL'
+              elif row['protected_exit']==124 or row['plain_exit']==124:
+                  verdict='INCONCLUSIVE_TIMEOUT'
+              elif row['protected_quicksafe_handler'] and row['plain_exit']==0 and row['plain_returned']:
+                  verdict='QUICKSAFE_INTERCEPTED_DIFFERENTIAL'
+              elif row['protected_exit']!=0 and row['plain_exit']==0:
+                  verdict='PROTECTED_ONLY_FAILURE_CAUSE_UNCONFIRMED'
+              elif row['protected_exit']==0 and row['protected_returned']:
+                  verdict='NOT_DETECTED_IN_THIS_RUN'
+              else:
+                  verdict='INCONCLUSIVE'
+              row['verdict']=verdict
+              records.append(row)
+              print(f'{label:18} plain={row["plain_exit"]:4} protected={row["protected_exit"]:4} QS_handler={row["protected_quicksafe_handler"]} verdict={verdict}', flush=True)
+          with (d/'matrix.csv').open('w',newline='') as f:
+              writer=csv.DictWriter(f,fieldnames=list(records[0]));writer.writeheader();writer.writerows(records)
+          (d/'matrix.json').write_text(json.dumps(records,indent=2)+'\n')
+          detected=[r['label'] for r in records if r['verdict']=='QUICKSAFE_INTERCEPTED_DIFFERENTIAL']
+          undetected=[r['label'] for r in records if r['verdict']=='NOT_DETECTED_IN_THIS_RUN']
+          inconclusive=[r['label'] for r in records if 'INCONCLUSIVE' in r['verdict'] or 'UNCONFIRMED' in r['verdict']]
+          summary=f"""# Broad QuickSafe heap protection matrix
+          Cases executed: {len(records)} (normal, 15 out-of-bounds offsets, use-after-free, double-free)
+          QuickSafe-specific differential interceptions: {len(detected)}: {', '.join(detected) or 'none'}
+          Not detected in this run: {len(undetected)}: {', '.join(undetected) or 'none'}
+          Inconclusive: {len(inconclusive)}: {', '.join(inconclusive) or 'none'}
+          WARNING: No single test establishes universal bounds or lifetime protection. An exit code without QuickSafe handler evidence is not attributed to QuickSafe.
+          """
+          (d/'summary.txt').write_text(summary)
+          print(summary)
+          required=next(r for r in records if r['label']=='oob-4096')
+          normal=records[0]
+          if normal['verdict']!='PASS_NORMAL': raise SystemExit('Normal-access control failed')
+          if required['verdict']!='QUICKSAFE_INTERCEPTED_DIFFERENTIAL': raise SystemExit('Previously demonstrated 4096-byte protection regression or attribution missing')
+          PYMATRIX
+          cat "$D/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo 'PASS: broad matrix executed; normal control and previously verified 4096-byte QuickSafe interception retained.'
+
       - name: 06d - Report instrumentation coverage limitation
         id: coverage
         if: steps.build.outcome == 'success'
         run: |
           set -Eeuo pipefail
           if grep -Fq 'No targets found in $VP_TARGETS_STR; skipping...' "$QS_LOGS/quicksafe-build.log"; then
-            echo 'NOT VERIFIED: target-specific protection skipped because VP_TARGETS_STR has no matching targets.' | tee "$QS_LOGS/coverage.txt"
-            echo '::warning::Instrumentation plugin loaded, but target-specific memory protection was not exercised.'
+            echo 'BASELINE ONLY: unselected LibCalls build intentionally skipped target-specific protection; deep and broad experiments use separate explicit selectors.' | tee "$QS_LOGS/coverage.txt"
+            echo '::warning::Unselected LibCalls baseline is not instrumented; inspect deep-protection and broad-protection results for verified targeted tests.'
           else
             echo 'QuickSafe pass ran during fresh build; target-specific coverage requires further validation.' | tee "$QS_LOGS/coverage.txt"
           fi
@@ -479,7 +617,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v22 REPORT ================'
+          echo '================ QUICKSAFE v23 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "LLVM 16: ${{ steps.llvm16.outcome }}"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
@@ -489,6 +627,7 @@ jobs:
           echo "Smoke tests: ${{ steps.smoke.outcome }}"
           echo "Protection evidence: ${{ steps.protection.outcome }}"
           echo "Deep protection: ${{ steps.deep_protection.outcome }}"
+          echo "Broad protection: ${{ steps.broad_protection.outcome }}"
           for name in optional-spec-targets-fix.log import-preflight.log setup-help.log quicksafe-build.log quicksafe-libcalls-test.log libcalls-ldd.log runtime-library-dir.txt coverage.txt smoke-1.log smoke-2.log smoke-3.log protection-evidence.log target-parser-references.txt; do
             echo "--- $name (last 100 lines) ---"
             tail -100 "$QS_LOGS/$name" 2>/dev/null || true
@@ -496,7 +635,7 @@ jobs:
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v22'
+            echo '# QuickSafe Oracle v23'
             echo "**Runner:** $RUNNER_NAME"
             echo "**LLVM 16:** ${{ steps.llvm16.outcome }}"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
@@ -506,6 +645,8 @@ jobs:
             echo "**Smoke tests:** ${{ steps.smoke.outcome }}"
             echo "**Protection evidence:** ${{ steps.protection.outcome }}"
             echo "**Deep protection:** ${{ steps.deep_protection.outcome }}"
+            echo "**Broad protection:** ${{ steps.broad_protection.outcome }}"
+            if [[ -f "$QS_LOGS/broad-protection/summary.txt" ]]; then cat "$QS_LOGS/broad-protection/summary.txt"; fi
             if [[ -f "$QS_LOGS/coverage.txt" ]]; then cat "$QS_LOGS/coverage.txt"; fi
             echo "**Logs:** $QS_LOGS"
             echo 'Build/test logs are checked for swallowed Python tracebacks as well as exit status.'
@@ -515,7 +656,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v22-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v23-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
@@ -536,6 +677,7 @@ jobs:
           [[ "${{ steps.smoke.outcome }}" == success ]] || { echo '::error::Smoke tests failed'; exit 1; }
           [[ "${{ steps.protection.outcome }}" == success ]] || { echo '::error::Protection evidence checks failed'; exit 1; }
           [[ "${{ steps.deep_protection.outcome }}" == success ]] || { echo '::error::Deep protection experiment failed; inspect deep-protection diagnostics'; exit 1; }
+          [[ "${{ steps.broad_protection.outcome }}" == success ]] || { echo '::error::Broad protection matrix failed; inspect broad-protection diagnostics'; exit 1; }
           [[ "${{ steps.coverage.outcome }}" == success ]] || { echo '::error::Coverage classification failed'; exit 1; }
           echo 'PASS: QuickSafe build, LibCalls execution, artifacts and three smoke tests.'
-          echo 'Deep protection experiment completed; see its verdict for security-specific attribution.'
+          echo 'Deep and broad protection experiments completed; inspect both reports for per-case evidence and limits.'
