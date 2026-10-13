@@ -1,12 +1,12 @@
-name: QuickSafe-oracle v16 - Build and Test QuickSafe
-run-name: QuickSafe v16 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v17 - Build and Test QuickSafe
+run-name: QuickSafe v17 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/QuickSafe-oracle-v16.yml'
+      - '.github/workflows/QuickSafe-oracle-v17.yml'
 
 permissions:
   contents: read
@@ -171,7 +171,7 @@ jobs:
           export CMAKE_BUILD_PARALLEL_LEVEL=1
           export MAKEFLAGS=-j1
           echo 'Building actual QuickSafe instrumentation and LibCalls target.'
-          python -u setup.py build LibCalls QuickSafe -j 1 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
+          python -u setup.py -j 1 build LibCalls QuickSafe 2>&1 | tee "$QS_LOGS/quicksafe-build.log"
           rc=${PIPESTATUS[0]}
           printf '%s\n' "$rc" > "$QS_LOGS/build.exit"
           exit "$rc"
@@ -193,7 +193,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo '================ QUICKSAFE v16 REPORT ================'
+          echo '================ QUICKSAFE v17 REPORT ================'
           echo "Runner: $RUNNER_NAME"
           echo "Python setup: ${{ steps.python_setup.outcome }}"
           echo "Build: ${{ steps.build.outcome }}"
@@ -205,7 +205,7 @@ jobs:
           free -h
           df -h "$QS_ROOT" || true
           {
-            echo '# QuickSafe Oracle v16'
+            echo '# QuickSafe Oracle v17'
             echo "**Runner:** $RUNNER_NAME"
             echo "**Python setup:** ${{ steps.python_setup.outcome }}"
             echo "**Build:** ${{ steps.build.outcome }}"
@@ -218,7 +218,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QuickSafe-oracle-v16-${{ github.run_id }}-${{ github.run_attempt }}
+          name: QuickSafe-oracle-v17-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/ubuntu/quicksafe-work/ci-logs/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 30
