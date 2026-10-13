@@ -29,36 +29,34 @@ jobs:
           sudo apt-get install -y clang-16 llvm-16-dev libclang-16-dev lld-16 cmake ninja-build ccache pkg-config libxml2-dev libzstd-dev zlib1g-dev libunwind-dev python3 gdb binutils
           mkdir -p "$EVIDENCE"
           uname -a | tee "$EVIDENCE/platform.txt"
-      - name: Locate real QuickSafe source, including committed archives
+      - name: Checkout upstream VUSec QuickSafe (real source)
+        uses: actions/checkout@v4
+        with:
+          repository: vusec/QuickSafe
+          ref: master
+          path: upstream-quicksafe
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate upstream checkout and record provenance
         shell: bash
         run: |
           set -euo pipefail
-          echo "Checkout: $PWD" | tee "$EVIDENCE/discovery.txt"
-          find . -maxdepth 4 -type f \( -name 'Handlers.cpp' -o -iname '*quicksafe*.zip' -o -name CMakeLists.txt \) | head -100 | tee -a "$EVIDENCE/discovery.txt"
-          python3 - <<'PY'
-          import os, pathlib, zipfile
-          root=pathlib.Path.cwd()
-          def valid(p):
-              return all((p/x).is_file() for x in ('CMakeLists.txt','src/Handlers.cpp','external/QuicksafeRT/src/guard.cpp'))
-          roots=[p.parent.parent for p in root.rglob('src/Handlers.cpp') if valid(p.parent.parent) and 'qs-build' not in p.parts]
-          if not roots:
-              archives=[p for p in root.rglob('*.zip') if 'quicksafe' in p.name.lower()]
-              print('QuickSafe archives:', [str(p) for p in archives])
-              if len(archives)==1:
-                  dest=pathlib.Path(os.environ['RUNNER_TEMP'])/'qs-unpacked';dest.mkdir()
-                  with zipfile.ZipFile(archives[0]) as z:
-                      for i in z.infolist():
-                          resolved=(dest/i.filename).resolve()
-                          if not resolved.is_relative_to(dest.resolve()) or i.file_size>1024**3:
-                              raise SystemExit('Unsafe archive member: '+i.filename)
-                      z.extractall(dest)
-                  roots=[p.parent.parent for p in dest.rglob('src/Handlers.cpp') if valid(p.parent.parent)]
-          roots=list(dict.fromkeys(p.resolve() for p in roots))
-          print('Validated roots:', [str(p) for p in roots])
-          if len(roots)!=1:
-              raise SystemExit('Need exactly one complete QuickSafe source tree or one committed QuickSafe ZIP; found '+str(len(roots)))
-          with open(os.environ['GITHUB_ENV'],'a') as f: f.write('QS_SOURCE='+str(roots[0])+'\n')
-          PY
+          QS_SOURCE="$GITHUB_WORKSPACE/upstream-quicksafe/quicksafe"
+          echo "QS_SOURCE=$QS_SOURCE" >> "$GITHUB_ENV"
+          echo "Upstream revision:"
+          git -C "$GITHUB_WORKSPACE/upstream-quicksafe" rev-parse HEAD | tee "$EVIDENCE/upstream-commit.txt"
+          git -C "$GITHUB_WORKSPACE/upstream-quicksafe" submodule status --recursive | tee "$EVIDENCE/submodules.txt"
+          echo "Checkout tree:"
+          find "$GITHUB_WORKSPACE/upstream-quicksafe" -maxdepth 3 -type f | head -100 | tee "$EVIDENCE/tree.txt"
+          for required in CMakeLists.txt src/Handlers.cpp external/QuicksafeRT/src/guard.cpp; do
+            if [ ! -f "$QS_SOURCE/$required" ]; then
+              echo "::error::Missing upstream file: $QS_SOURCE/$required"
+              exit 1
+            fi
+          done
+          sha256sum "$QS_SOURCE/src/Handlers.cpp" "$QS_SOURCE/external/QuicksafeRT/src/guard.cpp" | tee "$EVIDENCE/source-sha256.txt"
+
       - name: Preserve source and inspect exact statements
         run: |
           set -euo pipefail
@@ -137,6 +135,9 @@ jobs:
             "$RUNNER_TEMP/two_cases.cpp" "$HANDLERS" \
             -Wl,-rpath,"$(dirname "$HANDLERS")" \
             -o "$RUNNER_TEMP/two_cases"
+          RUNTIME_LIB="$(find "$RUNNER_TEMP/qs-build" -name "libQuicksafeRT.so" -print -quit)"
+          test -n "$RUNTIME_LIB"
+          export LD_LIBRARY_PATH="$(dirname "$HANDLERS"):$(dirname "$RUNTIME_LIB"):${LD_LIBRARY_PATH:-}"
           ldd "$RUNNER_TEMP/two_cases" | tee "$EVIDENCE/ldd.txt"
           if grep -q 'not found' "$EVIDENCE/ldd.txt"; then exit 1; fi
           nm -D "$HANDLERS" | grep -E '__vp_handle_realloc(array)?_target' | tee "$EVIDENCE/symbols.txt"
@@ -147,6 +148,9 @@ jobs:
           set -uo pipefail
           ulimit -c 0
           export QS_BINARY="$RUNNER_TEMP/two_cases"
+          HANDLERS="$(find "$RUNNER_TEMP/qs-build" -name "libQuickSafeHandlers.so" -print -quit)"
+          RUNTIME_LIB="$(find "$RUNNER_TEMP/qs-build" -name "libQuicksafeRT.so" -print -quit)"
+          export LD_LIBRARY_PATH="$(dirname "$HANDLERS"):$(dirname "$RUNTIME_LIB"):${LD_LIBRARY_PATH:-}"
           python3 - <<'PY'
           import os, subprocess, pathlib, json, signal, time
           out=pathlib.Path(os.environ['EVIDENCE'])
