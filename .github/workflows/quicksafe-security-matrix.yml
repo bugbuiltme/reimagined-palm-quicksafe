@@ -1,4 +1,4 @@
-name: QuickSafe original handler crash boundary regression
+name: QuickSafe expanded real-runtime boundary tests
 on:
   workflow_dispatch:
   push:
@@ -86,6 +86,7 @@ jobs:
           #include <cerrno>
           #include <malloc.h>
           #include <limits>
+          #include <algorithm>
           #include <unistd.h>
           extern "C" void* __vp_handle_realloc_target(void*,size_t);
           extern "C" void* __vp_handle_reallocarray_target(void*,size_t,size_t);
@@ -97,10 +98,13 @@ jobs:
             const char* mode=argv[1];
             size_t old_requested=128;
             size_t new_requested=8;
-            bool shrink_case=false, array_case=false, positive_wrap=false;
-            if (sscanf(mode,"shrink_%zu_to_%zu",&old_requested,&new_requested)==2) shrink_case=true;
-            else if (sscanf(mode,"array_overflow_zero_%zu",&old_requested)==1) array_case=true;
-            else if (sscanf(mode,"array_overflow_positive_%zu",&old_requested)==1) {array_case=true;positive_wrap=true;}
+            bool resize_case=false, array_case=false, positive_wrap=false, normal_array=false;
+            size_t element_size=16;
+            if (sscanf(mode,"resize_%zu_to_%zu",&old_requested,&new_requested)==2) resize_case=true;
+            else if (sscanf(mode,"array_normal_%zu_to_%zu",&old_requested,&new_requested)==2) {array_case=true;normal_array=true;}
+            else if (sscanf(mode,"array_overflow_zero_%zu_elem_%zu",&old_requested,&element_size)==2) array_case=true;
+            else if (sscanf(mode,"array_overflow_positive_%zu_elem_%zu",&old_requested,&element_size)==2) {array_case=true;positive_wrap=true;}
+            if(element_size==0 || (element_size & (element_size-1))!=0) return 94;
             if(old_requested > 1024*1024 || new_requested > 1024*1024) return 93;
             long page_size=sysconf(_SC_PAGESIZE);
             fprintf(stderr,"PAGE_SIZE=%ld\n",page_size);
@@ -111,13 +115,13 @@ jobs:
             fprintf(stderr,"CASE=%s old_requested=%zu old_usable=%zu old_ptr=%p\n",mode,old_requested,usable,p);
             void* q=nullptr;
             errno=0;
-            if(shrink_case) {
+            if(resize_case) {
               fprintf(stderr,"CALL original __vp_handle_realloc_target(p,%zu); copy_len=%zu; requested_destination=%zu\n",new_requested,usable,new_requested);
               q=__vp_handle_realloc_target(p,new_requested);
             } else if(array_case) {
-              size_t count=std::numeric_limits<size_t>::max()/16+(positive_wrap?2:1);
-              size_t element_size=16;
-              fprintf(stderr,"CALL original __vp_handle_reallocarray_target(p,%zu,%zu); wrapped_size=%zu\n",count,element_size,count*element_size);
+              size_t count=normal_array ? new_requested : std::numeric_limits<size_t>::max()/element_size+(positive_wrap?2:1);
+              size_t wrapped=count*element_size;
+              fprintf(stderr,"CALL original __vp_handle_reallocarray_target(p,%zu,%zu); wrapped_size=%zu; old_usable=%zu\n",count,element_size,wrapped,usable);
               q=__vp_handle_reallocarray_target(p,count,element_size);
             } else if(strcmp(mode,"control_grow")==0) {
               fprintf(stderr,"CALL original __vp_handle_realloc_target(p,256)\n");
@@ -166,11 +170,13 @@ jobs:
           import os, subprocess, pathlib, json, signal, time
           out=pathlib.Path(os.environ['EVIDENCE'])
           binary=os.environ['QS_BINARY']
-          sizes=[128,4095,4096,4097,8192,16384,65536]
+          # Each process is isolated: an expected QuickSafe fatal exit cannot abort the matrix.
+          sizes=[1,8,16,128,255,256,4095,4096,4097,8192,16384,65536]
           names=['control_grow','control_libc_overflow']
-          names += [f'shrink_{n}_to_8' for n in sizes]
-          names += [f'array_overflow_zero_{n}' for n in sizes]
-          names += [f'array_overflow_positive_{n}' for n in sizes]
+          names += [f'resize_{n}_to_{dest}' for n in sizes for dest in [1,8,16,128] if dest<=n]
+          names += [f'resize_{n}_to_{dest}' for n,dest in [(8,8),(128,128),(128,256),(4096,8192)]]
+          names += [f'array_normal_{n}_to_{count}' for n,count in [(128,1),(128,8),(4096,1),(4096,256)]]
+          names += [f'array_overflow_{kind}_{n}_elem_{elem}' for kind in ['zero','positive'] for n in [128,4095,4096,4097,16384,65536] for elem in [2,8,16,64]]
           records=[]
           for name in names:
               print('\n'+'='*75+'\n'+name,flush=True)
@@ -189,11 +195,17 @@ jobs:
               elif rc==0: classification='RETURNED_NO_MEMORY_SAFETY_PROOF'
               else: classification='NONZERO_EXIT_'+str(rc)
               if name=='control_libc_overflow' and rc==0: classification='CONTROL_REJECTED_OVERFLOW_AND_PRESERVED_SOURCE'
+              if rc==123 and 'Caught SIGSEGV' in log and ('__vp_handle_realloc_target' in log or '__vp_handle_reallocarray_target' in log):
+                  classification='QUICKSAFE_CAUGHT_SIGSEGV_REVIEW_TRACE'
               record={'case':name,'exit_code':rc,'classification':classification,'elapsed_seconds':round(time.monotonic()-started,3)}
               records.append(record)
               print(json.dumps(record),flush=True)
               # Obtain a second-run debugger backtrace; it is not guaranteed to reproduce.
-              if name.startswith(('shrink_','array_overflow_')) and (rc < 0 or rc != 0 or name.endswith(('16384','65536')) or name.startswith(('shrink_16384','shrink_65536'))):
+              # Debugger only for a small representative sample; full matrix stays fast.
+              selected = (name in ['resize_128_to_8','resize_4096_to_1','resize_65536_to_8',
+                                   'array_overflow_zero_128_elem_16','array_overflow_positive_65536_elem_16',
+                                   'array_normal_4096_to_1'])
+              if selected and rc != 0:
                   cmd=['gdb','-q','-batch','-ex','set pagination off','-ex','set print thread-events off','-ex','run','-ex','bt full','-ex','info registers','--args',binary,name]
                   try:
                       d=subprocess.run(cmd,capture_output=True,text=True,errors='replace',timeout=35)
@@ -201,11 +213,15 @@ jobs:
                   except subprocess.TimeoutExpired as e:
                       (out/(name+'.gdb.txt')).write_text('Debugger timeout; inspect primary run\n')
           (out/'results.json').write_text(json.dumps(records,indent=2))
+          counts={}
+          for record in records: counts[record['classification']]=counts.get(record['classification'],0)+1
+          (out/'counts.json').write_text(json.dumps(counts,indent=2))
+          print('RESULT_COUNTS',json.dumps(counts),flush=True)
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
               f.write('## QuickSafe real handler results (${{ matrix.detect_mode }})\n\n')
               f.write('| Case | Exit | Classification |\n|---|---:|---|\n')
               for r in records:f.write(f"| {r['case']} | {r['exit_code']} | {r['classification']} |\n")
-              f.write('\nThese tests use the unchanged upstream handlers and runtime. A signal alone does not prove an out-of-bounds write; inspect `.gdb.txt` for the faulting instruction and `memcpy` stack. Normal return does not prove safety.\n')
+              f.write('\nThese tests use unchanged upstream handlers and runtime. `QUICKSAFE_CAUGHT_SIGSEGV_REVIEW_TRACE` requires inspection of the memcpy backtrace; a normal return is not proof of safety.\n')
           PY
       - name: Upload all diagnostic evidence even on failure
         if: always()
