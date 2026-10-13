@@ -1,5 +1,5 @@
-name: QuickSafe-oracle v23 - Build and Test QuickSafe
-run-name: QuickSafe v23 | ${{ github.event_name }} | ${{ github.run_number }}
+name: QuickSafe-oracle v24 - Build and Test QuickSafe
+run-name: QuickSafe v24 | ${{ github.event_name }} | ${{ github.run_number }}
 
 on:
   workflow_dispatch:
